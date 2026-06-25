@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights and checkpoints
+*.bin
+*.safetensors
+*.pt
+*.pth
+checkpoints/
+
+# wandb
+wandb/
+
+# Videos and frames
+*.mp4
+*.gif
+*.png
+*.jpg
+
+# macOS
+.DS_Store
