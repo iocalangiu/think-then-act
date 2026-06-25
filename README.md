@@ -1,8 +1,10 @@
-# RL Harness — Vision-Guided Robot Arm
+# think-then-act
 
 Training a robot arm to plan a sequence of actions using images of the environment.
 
 The arm lives in the **FetchPickAndPlace-v3** MuJoCo environment. The task is to pick up a block and move it to a target location.
+
+This is work in progress with the idea to discover and understand differences in computational costs and accuracy between GRPO and PPO, as well as experimenting with different fine-tuning adapters.
 
 ---
 
