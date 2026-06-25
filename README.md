@@ -53,7 +53,6 @@ Two memory constraints shaped the implementation:
 | Policy | Qwen2-VL-2B-Instruct |
 | RL algorithm | GRPO + LoRA (peft 0.12.0) |
 | Compute | Modal serverless (A10G for training, T4 for eval) |
-| Experiment tracking | Weights & Biases |
 
 ---
 
@@ -73,10 +72,9 @@ run_train_m6.py   — full training run (50–100 iterations, checkpoints, inter
 
 ## Running
 
-**Training (50 iterations, W&B logging):**
+**Training (50 iterations):**
 ```bash
-modal secret create wandb-secret WANDB_API_KEY=<your-key>
-modal run --detach run_train_m6.py --wandb-project rl-harness-robotics
+modal run --detach run_train_m6.py
 ```
 
 **Evaluation against a checkpoint:**
