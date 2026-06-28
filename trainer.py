@@ -60,6 +60,9 @@ class GRPOConfig:
     # Set to 0.0 once the policy generates diverse actions on its own (M6+).
     reward_noise_std: float = 0.05
 
+    # Environment randomisation (match SFT training distribution)
+    randomize_env : bool  = True   # shift robot base + random block/target each episode
+
     # Optimisation
     lr            : float = 5e-5
     max_grad_norm : float = 1.0
@@ -155,6 +158,16 @@ class GRPOTrainer:
             torch.cuda.manual_seed(state_seed * 10_000 + g * 100)
 
             current_obs, _ = env.reset(seed=state_seed)
+
+            if self.config.randomize_env:
+                from env_utils import init_random_episode
+                # Same rng seed for all rollouts in group → same block/target positions,
+                # different action sequences (diversity comes from temperature sampling).
+                rng = np.random.default_rng(state_seed)
+                current_obs, ok = init_random_episode(env, rng)
+                if not ok:
+                    current_obs, _ = env.reset(seed=state_seed)  # fallback
+
             episode_steps  = []
             total_reward   = 0.0
 
@@ -172,7 +185,14 @@ class GRPOTrainer:
                     achieved_goal=achieved, desired_goal=desired, distance=distance
                 )
                 # 224×224: ~64 visual tokens vs ~289 at 480×480; critical for grad memory.
-                pil_image = Image.fromarray(frame).resize((224, 224), Image.LANCZOS)
+                # Per-rollout pixel noise breaks within-group mode collapse: same visual
+                # state → different tokens → different generation paths → diverse log_probs.
+                noise_rng  = np.random.default_rng(state_seed * 10_000 + g * 100 + step_num)
+                frame_noisy = np.clip(
+                    frame.astype(np.int32) + noise_rng.integers(-8, 9, frame.shape),
+                    0, 255,
+                ).astype(np.uint8)
+                pil_image = Image.fromarray(frame_noisy).resize((224, 224), Image.LANCZOS)
                 messages  = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": [
@@ -454,6 +474,11 @@ class GRPOTrainer:
         print(f"[GRPOTrainer] LoRA checkpoint saved → {path}")
 
     def load_checkpoint(self, path: str) -> None:
+        import torch
         from peft import PeftModel
-        self.model = PeftModel.from_pretrained(self.base_model, path)
+        self.model = PeftModel.from_pretrained(self.base_model, path, is_trainable=True)
+        self.model.enable_input_require_grads()
+        self.model.gradient_checkpointing_enable()
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.Adam(trainable, lr=self.config.lr)
         print(f"[GRPOTrainer] LoRA checkpoint loaded ← {path}")
