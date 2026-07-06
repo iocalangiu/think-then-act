@@ -30,7 +30,7 @@ from modal_config import app, rl_image, model_volume, MODEL_CACHE_DIR
     volumes={MODEL_CACHE_DIR: model_volume},  # persist downloaded weights
     timeout=1800,                          # first run downloads ~4 GB
 )
-def run_vlm_policy_steps(n_steps: int = 3) -> dict:
+def run_vlm_policy_steps(n_steps: int = 3, use_sft: bool = False) -> dict:
     """
     Runs n_steps of VLM-driven control and returns a JSON-safe summary.
     """
@@ -55,9 +55,10 @@ def run_vlm_policy_steps(n_steps: int = 3) -> dict:
     # ------------------------------------------------------------------
     # Step 1: Load VLM policy (downloads model on first run)
     # ------------------------------------------------------------------
-    print(f"\n[1/4] Loading VLM policy...")
+    print(f"\n[1/4] Loading VLM policy{'  [SFT LoRA]' if use_sft else '  [base]'}...")
     t0 = time.time()
-    policy = VLMPolicy(cache_dir=MODEL_CACHE_DIR)
+    lora_path = f"{MODEL_CACHE_DIR}/checkpoints/sft_warmstart" if use_sft else None
+    policy = VLMPolicy(cache_dir=MODEL_CACHE_DIR, lora_path=lora_path)
     print(f"      Model ready in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
@@ -169,12 +170,12 @@ def run_vlm_policy_steps(n_steps: int = 3) -> dict:
 # Local entrypoint
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
-def main():
+def main(n_steps: int = 15, sft: bool = False):
     import json
 
     print("\nDispatching VLM policy run to Modal cloud...")
     print("(First run downloads Qwen2-VL-2B-Instruct ~4 GB — cached after that)\n")
-    result = run_vlm_policy_steps.remote(n_steps=3)
+    result = run_vlm_policy_steps.remote(n_steps=n_steps, use_sft=sft)
 
     print("\n--- Policy Summary (local terminal) ---")
     # Print without the verbose step_results

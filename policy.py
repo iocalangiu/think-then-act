@@ -16,10 +16,11 @@ Structured output format the policy must produce:
     <think>
     [natural language reasoning about the scene]
     </think>
-    <action>[dx, dy, dz, grip]</action>
+    <action>dx dy dz grip</action>
 
-Where dx/dy/dz are end-effector delta movements in [-1, 1] and grip is
-gripper command in [-1, 1] (negative = open, positive = close).
+Where dx/dy/dz/grip are integers in [0, 16] selecting from 17 evenly-spaced
+bins across [-1, 1].  Bin 0 = -1.0, bin 8 = 0.0 (no movement), bin 16 = +1.0.
+Grip: bin 0 = fully closed, bin 16 = fully open.
 """
 
 from __future__ import annotations
@@ -34,57 +35,56 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
+# Action discretisation — 17 bins, step 0.125, range [-1.0, 1.0].
+# Bin 0 = -1.0, bin 8 = 0.0 (no movement), bin 16 = +1.0.
+N_BINS = 17
+
+def encode_action(value: float) -> int:
+    """Continuous [-1, 1] → bin index [0, N_BINS-1]."""
+    idx = round((float(value) + 1.0) / 2.0 * (N_BINS - 1))
+    return int(np.clip(idx, 0, N_BINS - 1))
+
+def decode_action(bin_idx: int) -> float:
+    """Bin index [0, N_BINS-1] → continuous [-1, 1]."""
+    return float(bin_idx) / (N_BINS - 1) * 2.0 - 1.0
+
 # System prompt shown to the model before every turn.
 # The concrete example at the end dramatically improves format compliance
 # because the model can copy the structure rather than invent it.
 SYSTEM_PROMPT = """\
 You are a controller for a 7-DOF Fetch robot arm performing a pick-and-place task.
 
-TASK: Pick up the block on the table and move it to the target position (shown in the image).
+TASK: Pick up the block on the table and move it to the target position (shown in the image as a small sphere).
 
-ACTION SPACE — your output controls the gripper end-effector:
-  dx   : move left (−1.0) ↔ right (+1.0)
-  dy   : move backward (−1.0) ↔ forward (+1.0)
-  dz   : move down (−1.0) ↔ up (+1.0)
-  grip : open gripper (−1.0) ↔ close gripper (+1.0)
-All four values MUST be floats in [−1.0, 1.0].
+ACTION SPACE — output four integers, each in [0, 16]:
+  dx   : left (0) ↔ right (16),    bin 8 = no movement
+  dy   : backward (0) ↔ forward (16), bin 8 = no movement
+  dz   : down (0) ↔ up (16),       bin 8 = no movement
+  grip : closed (0) ↔ open (16),   bin 8 = half open
 
-YOU MUST ALWAYS RESPOND IN THIS EXACT FORMAT — no exceptions:
+Each bin step = 0.125 in normalised units.  Use large offsets from 8 (e.g. 0–3 or 13–16) when far, moderate (4–6 or 10–12) when close.
+
+YOU MUST ALWAYS RESPOND IN THIS EXACT FORMAT:
 <think>
-1. Where is the block right now?
-2. Where is the target?
-3. What should the arm do next to get the block to the target?
+[your reasoning about the current scene]
 </think>
-<action>[dx, dy, dz, grip]</action>
+<action>dx dy dz grip</action>
 
---- EXAMPLE A — arm above and to the right of block, needs to descend and align ---
-<think>
-Block is at [1.25, 0.75, 0.025] on the table surface. Target is at [1.20, 0.90, 0.44].
-Gripper is currently above and to the right of the block. Distance: 0.48 m.
-Priority: move left and down to align over the block, keep gripper open to receive it.
-</think>
-<action>[-0.8, 0.3, -0.9, -1.0]</action>
+Example: <action>13 8 5 16</action>  (move right, stay, move down slightly, open gripper)
 
---- EXAMPLE B — gripper is directly above block, ready to grasp and lift ---
-<think>
-Block is at [1.31, 0.74, 0.025]. Target is at [1.28, 0.74, 0.40]. Distance: 0.38 m, mostly vertical.
-Gripper is already aligned over the block. Close the gripper and lift sharply upward.
-</think>
-<action>[0.0, 0.0, 0.9, 1.0]</action>
+STRATEGY — identify your phase and act accordingly:
+  APPROACH : gripper not near block → move gripper toward block, keep open (grip=16)
+  GRASP    : gripper above block → descend (dz < 8), then close (grip=0)
+  CARRY    : block grasped → move toward target sphere, keep closed (grip=0)
 
---- EXAMPLE C — block grasped, carry it forward and slightly left to target ---
-<think>
-Block is at [1.30, 0.70, 0.15] — elevated, gripper is closed around it.
-Target is at [1.18, 0.88, 0.42]. I need to move left (−dx), forward (+dy), and up (+dz).
-</think>
-<action>[-0.6, 0.7, 0.5, 1.0]</action>"""
+Analyse the image carefully. Your chosen bins must reflect the CURRENT visual state."""
 
 # User prompt template — filled in with live state values each step.
 USER_PROMPT_TEMPLATE = """\
 Current state:
-  Block position  (achieved_goal) : {achieved_goal}
-  Target position (desired_goal)  : {desired_goal}
-  Distance block→target            : {distance:.4f} m
+  Gripper position : {gripper_pos}
+  Block position   : {achieved_goal}
+  Target position  : {desired_goal}
 
 Observe the image carefully and respond in the required format."""
 
@@ -105,6 +105,7 @@ class VLMPolicy:
         self,
         model_id: str = MODEL_ID,
         cache_dir: str | None = None,
+        lora_path: str | None = None,
         max_new_tokens: int = 256,
         device: str = "cuda",
     ) -> None:
@@ -124,6 +125,13 @@ class VLMPolicy:
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_id, **load_kwargs
         )
+
+        if lora_path:
+            from peft import PeftModel
+            print(f"[VLMPolicy] Loading LoRA adapter from {lora_path}...")
+            self.model = PeftModel.from_pretrained(self.model, lora_path)
+            print("[VLMPolicy] LoRA adapter loaded.")
+
         self.processor = AutoProcessor.from_pretrained(
             model_id,
             **({} if cache_dir is None else {"cache_dir": cache_dir}),
@@ -167,15 +175,14 @@ class VLMPolicy:
     # ------------------------------------------------------------------
 
     def _build_prompt(self, state_entry: dict) -> str:
-        achieved = [round(v, 4) for v in state_entry["achieved_goal"]]
-        desired  = [round(v, 4) for v in state_entry["desired_goal"]]
-        distance = float(np.linalg.norm(
-            np.array(state_entry["desired_goal"]) - np.array(state_entry["achieved_goal"])
-        ))
+        obs_arr     = np.array(state_entry["observation"])
+        gripper_pos = [round(v, 4) for v in obs_arr[0:3]]
+        achieved    = [round(v, 4) for v in state_entry["achieved_goal"]]
+        desired     = [round(v, 4) for v in state_entry["desired_goal"]]
         return USER_PROMPT_TEMPLATE.format(
+            gripper_pos=gripper_pos,
             achieved_goal=achieved,
             desired_goal=desired,
-            distance=distance,
         )
 
     def _generate(self, image: "Image.Image", user_text: str) -> str:
@@ -263,21 +270,20 @@ class VLMPolicy:
     @staticmethod
     def _parse_action(text: str) -> tuple[np.ndarray, bool]:
         """
-        Extract [dx, dy, dz, grip] from <action>[...]</action>.
-        Returns (action_array, tag_was_found).
+        Extract four bin indices from <action>dx dy dz grip</action> and decode
+        to continuous floats in [-1, 1].  Returns (action_array, tag_was_found).
 
-        Falls back to zeros if the format is wrong — so a bad model response
-        never crashes the episode loop.  The caller uses tag_was_found to
-        distinguish "model output zero action" from "tag missing entirely".
+        Falls back to zeros on any parse failure so a bad model response never
+        crashes the episode loop.
         """
-        match = re.search(r"<action>\s*\[([^\]]+)\]\s*</action>", text)
+        match = re.search(r"<action>\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*</action>", text)
         if not match:
             return np.zeros(4, dtype=np.float32), False
         try:
-            values = [float(v.strip()) for v in match.group(1).split(",")]
-            if len(values) != 4:
+            bins = [int(match.group(i)) for i in range(1, 5)]
+            if any(b < 0 or b >= N_BINS for b in bins):
                 return np.zeros(4, dtype=np.float32), False
-            action = np.clip(np.array(values, dtype=np.float32), -1.0, 1.0)
+            action = np.array([decode_action(b) for b in bins], dtype=np.float32)
             return action, True
         except ValueError:
             return np.zeros(4, dtype=np.float32), False
