@@ -28,7 +28,7 @@ The response is parsed by `_extract_think` and `_parse_action` into a 4-dimensio
 
 Rather than using the environment's sparse reward (+1 for correct placement, 0 otherwise), I implemented a **dense reward function** that rewards correct sub-steps of the sequence — for example, moving the gripper toward the block, or closing the gripper once near it.
 
-A structured reward function is possible here because the simulator provides ground-truth state. In domains without this, an LLM-as-judge could replace this step.
+A structured reward function is possible here because the simulator provides ground-truth state.
 
 ### GRPO Training
 
