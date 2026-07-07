@@ -40,7 +40,7 @@ def run_evaluation(
 ) -> dict:
     import os, time
     import numpy as np
-    import imageio
+    from env_utils import save_video
 
     os.environ["MUJOCO_GL"]          = "osmesa"
     os.environ["PYOPENGL_PLATFORM"]  = "osmesa"
@@ -219,23 +219,7 @@ def run_evaluation(
     # ------------------------------------------------------------------
     print("\n[4/4] Saving rollout video...")
     video_path = os.path.join(MODEL_CACHE_DIR, "eval_rollout.mp4")
-    # PyAV (imageio's default MP4 backend) lacks libx264. Use system ffmpeg instead:
-    # write frames to a temp dir, then encode with the apt-installed ffmpeg binary.
-    import subprocess, tempfile
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        for i, frame in enumerate(video_frames):
-            imageio.imwrite(os.path.join(tmp_dir, f"frame_{i:04d}.png"), frame)
-        subprocess.run(
-            ["ffmpeg", "-y", "-framerate", "10",
-             "-i", os.path.join(tmp_dir, "frame_%04d.png"),
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", video_path],
-            check=True, capture_output=True,
-        )
-    finally:
-        for f in os.listdir(tmp_dir):
-            os.remove(os.path.join(tmp_dir, f))
-        os.rmdir(tmp_dir)
+    save_video(video_frames, video_path, fps=10)
     model_volume.commit()
     print(f"  Saved → {video_path}")
     print(f"  Download: modal volume get rl-harness-model-cache eval_rollout.mp4 ./eval_rollout.mp4")

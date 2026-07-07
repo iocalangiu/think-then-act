@@ -116,13 +116,11 @@ def run_sft_training(
         ).resize((224, 224), Image.LANCZOS)
 
         # Rebuild user prompt — must match inference-time format exactly
-        achieved  = [round(v, 4) for v in ex["achieved_goal"]]
-        desired   = [round(v, 4) for v in ex["desired_goal"]]
-        distance  = float(np.linalg.norm(
-            np.array(ex["desired_goal"]) - np.array(ex["achieved_goal"])
-        ))
-        user_text = USER_PROMPT_TEMPLATE.format(
-            achieved_goal=achieved, desired_goal=desired, distance=distance
+        gripper_pos = [round(v, 4) for v in ex["gripper_pos"]]
+        achieved    = [round(v, 4) for v in ex["achieved_goal"]]
+        desired     = [round(v, 4) for v in ex["desired_goal"]]
+        user_text   = USER_PROMPT_TEMPLATE.format(
+            gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
         )
 
         messages = [
@@ -151,7 +149,7 @@ def run_sft_training(
         # Target response: think content + </think> + action tag.
         # <think> is already in the prompt (from add_generation_prompt),
         # so we only provide what comes after it.
-        action_str = str(ex["action"])   # e.g. "[0.5, -0.3, 0.8, 1.0]"
+        action_str = " ".join(str(b) for b in ex["action_bins"])  # e.g. "13 8 5 16"
         response   = f"{ex['think']}\n</think>\n<action>{action_str}</action>"
         full_text  = text_input + response
 
@@ -186,13 +184,11 @@ def run_sft_training(
                 io.BytesIO(base64.b64decode(eval_ex["frame_b64"]))
             ).resize((224, 224), Image.LANCZOS)
 
-            achieved = [round(v, 4) for v in eval_ex["achieved_goal"]]
-            desired  = [round(v, 4) for v in eval_ex["desired_goal"]]
-            dist     = float(np.linalg.norm(
-                np.array(eval_ex["desired_goal"]) - np.array(eval_ex["achieved_goal"])
-            ))
-            user_text = USER_PROMPT_TEMPLATE.format(
-                achieved_goal=achieved, desired_goal=desired, distance=dist
+            gripper_pos = [round(v, 4) for v in eval_ex["gripper_pos"]]
+            achieved    = [round(v, 4) for v in eval_ex["achieved_goal"]]
+            desired     = [round(v, 4) for v in eval_ex["desired_goal"]]
+            user_text   = USER_PROMPT_TEMPLATE.format(
+                gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
             )
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -210,13 +206,15 @@ def run_sft_training(
                 return_tensors="pt", padding=True,
             ).to("cuda")
 
-            out        = model.generate(**enc, max_new_tokens=100, do_sample=False)
+            out        = model.generate(**enc, max_new_tokens=256, do_sample=False,
+                                        stop_strings=["</action>"], tokenizer=processor.tokenizer)
             new_tokens = out[0][enc["input_ids"].shape[1]:]
             text       = processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
         model.train()
         print(f"\n  [EVAL {label}]")
         print(f"  state: achieved={achieved}  desired={desired}  phase={eval_ex['phase']}")
+        print(f"  target action bins: {eval_ex['action_bins']}")
         print(f"  generated: {text[:400]}")
         print()
 
@@ -265,7 +263,7 @@ def run_sft_training(
                 quick_eval(f"epoch {epoch+1} step {i+1}")
 
             if global_step % 500 == 0:
-                ckpt_path = os.path.join(MODEL_CACHE_DIR, "checkpoints", "sft_warmstart")
+                ckpt_path = os.path.join(MODEL_CACHE_DIR, "checkpoints", f"sft_step_{global_step}")
                 os.makedirs(ckpt_path, exist_ok=True)
                 model.save_pretrained(ckpt_path)
                 model_volume.commit()
@@ -277,12 +275,16 @@ def run_sft_training(
         if eval_every > 0:
             quick_eval(f"end of epoch {epoch+1}")
 
-        # Save after every epoch so a mid-training cancellation doesn't lose work
-        ckpt_path = os.path.join(MODEL_CACHE_DIR, "checkpoints", "sft_warmstart")
+        # Save epoch checkpoint and update the canonical warmstart pointer
+        epoch_ckpt = os.path.join(MODEL_CACHE_DIR, "checkpoints", f"sft_epoch_{epoch+1}")
+        os.makedirs(epoch_ckpt, exist_ok=True)
+        model.save_pretrained(epoch_ckpt)
+        # Also keep sft_warmstart pointing at the latest epoch for GRPO convenience
+        ckpt_path  = os.path.join(MODEL_CACHE_DIR, "checkpoints", "sft_warmstart")
         os.makedirs(ckpt_path, exist_ok=True)
         model.save_pretrained(ckpt_path)
         model_volume.commit()
-        print(f"  Checkpoint saved → {ckpt_path}")
+        print(f"  Checkpoint saved → {epoch_ckpt}  (and → {ckpt_path})")
 
     # ------------------------------------------------------------------
     # 5. Final summary
@@ -313,8 +315,9 @@ def main(
     print(f"\nDispatching SFT training to Modal (A10G)...")
     print(f"  epochs={n_epochs}  lr={lr}  grad_accum={grad_accum_steps}  eval_every={eval_every}\n")
 
-    result = run_sft_training.remote(
+    handle = run_sft_training.spawn(
         n_epochs=n_epochs, lr=lr, grad_accum_steps=grad_accum_steps, eval_every=eval_every
     )
-    print(f"\nDone. Loss trend: {result['loss_trend']}")
-    print(f"Checkpoint: {result['ckpt_path']}")
+    print(f"Job spawned. Function call ID: {handle.object_id}")
+    print(f"Monitor at https://modal.com")
+    print(f"Checkpoint will be saved to: {MODEL_CACHE_DIR}/checkpoints/sft_warmstart")

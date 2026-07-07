@@ -154,6 +154,7 @@ class GRPOTrainer:
         rollouts = []
 
         for g in range(self.config.group_size):
+            _logged_failure = False   # print at most one failed response per rollout
             # Unique CUDA seed per rollout; env.reset(seed=...) may reset torch RNG.
             torch.cuda.manual_seed(state_seed * 10_000 + g * 100)
 
@@ -175,14 +176,12 @@ class GRPOTrainer:
                 frame = env.last_frame()   # current visual state (before this action)
 
                 # Build VLM prompt from current observation.
-                achieved  = [round(v, 4) for v in current_obs["achieved_goal"]]
-                desired   = [round(v, 4) for v in current_obs["desired_goal"]]
-                distance  = float(np.linalg.norm(
-                    np.array(current_obs["desired_goal"])
-                    - np.array(current_obs["achieved_goal"])
-                ))
-                user_text = USER_PROMPT_TEMPLATE.format(
-                    achieved_goal=achieved, desired_goal=desired, distance=distance
+                obs_arr     = current_obs["observation"]
+                gripper_pos = [round(v, 4) for v in obs_arr[0:3]]
+                achieved    = [round(v, 4) for v in current_obs["achieved_goal"]]
+                desired     = [round(v, 4) for v in current_obs["desired_goal"]]
+                user_text   = USER_PROMPT_TEMPLATE.format(
+                    gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
                 )
                 # 224×224: ~64 visual tokens vs ~289 at 480×480; critical for grad memory.
                 # Per-rollout pixel noise breaks within-group mode collapse: same visual
@@ -215,11 +214,14 @@ class GRPOTrainer:
                         **inputs,
                         max_new_tokens=256,
                         do_sample=True,
-                        temperature=1.5,
+                        temperature=0.7,
                         top_p=0.95,
+                        stop_strings=["</action>"],
+                        tokenizer=self.processor.tokenizer,
                     )
 
                 gen_ids  = [o[len(i):] for i, o in zip(inputs["input_ids"], out_ids)]
+                n_gen_tokens = len(gen_ids[0])
                 response = self.processor.batch_decode(
                     gen_ids, skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
@@ -227,6 +229,11 @@ class GRPOTrainer:
 
                 action, action_found = VLMPolicy._parse_action(response)
                 if not action_found:
+                    if not _logged_failure:
+                        _logged_failure = True
+                        preview = response.replace("\n", " ")[:220]
+                        print(f"      [parse FAIL] g={g} step={step_num} "
+                              f"tokens={n_gen_tokens}  |  {preview!r}")
                     # Seeded random fallback keeps rollout diversity when tag is absent.
                     rng    = np.random.default_rng(state_seed * 10_000 + g * 100 + step_num)
                     action = rng.uniform(-1.0, 1.0, size=4).astype(np.float32)
@@ -311,14 +318,12 @@ class GRPOTrainer:
         response    = step["response"]
 
         # Rebuild prompt (identical to collection phase).
-        achieved  = [round(v, 4) for v in state_entry["achieved_goal"]]
-        desired   = [round(v, 4) for v in state_entry["desired_goal"]]
-        distance  = float(np.linalg.norm(
-            np.array(state_entry["desired_goal"])
-            - np.array(state_entry["achieved_goal"])
-        ))
-        user_text  = USER_PROMPT_TEMPLATE.format(
-            achieved_goal=achieved, desired_goal=desired, distance=distance
+        obs_arr     = np.array(state_entry["observation"])
+        gripper_pos = [round(v, 4) for v in obs_arr[0:3]]
+        achieved    = [round(v, 4) for v in state_entry["achieved_goal"]]
+        desired     = [round(v, 4) for v in state_entry["desired_goal"]]
+        user_text   = USER_PROMPT_TEMPLATE.format(
+            gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
         )
         pil_image  = Image.fromarray(frame)
         messages   = [
@@ -390,11 +395,14 @@ class GRPOTrainer:
         loss_scalar    : float       = 0.0
         total_rollouts : int         = sum(len(g) for g in rollout_groups)
 
+        within_group_stds : list[float] = []
+
         for group in rollout_groups:
             rewards    = np.array([r["total_reward"] for r in group], dtype=np.float64)
             std        = rewards.std() + 1e-8
             advantages = (rewards - rewards.mean()) / std
 
+            within_group_stds.append(float(rewards.std()))
             all_rewards.extend(rewards.tolist())
             all_advantages.extend(advantages.tolist())
 
@@ -416,11 +424,21 @@ class GRPOTrainer:
         )
         self.optimizer.step()
 
+        n_parsed = sum(
+            1 for group in rollout_groups for r in group
+            for s in r["steps"] if s.get("action_parsed", False)
+        )
+        n_total = sum(
+            r["n_steps"] for group in rollout_groups for r in group
+        )
+
         return {
-            "loss"        : loss_scalar,
-            "mean_reward" : float(np.mean(all_rewards)),
-            "std_reward"  : float(np.std(all_rewards)),
-            "mean_abs_adv": float(np.mean(np.abs(all_advantages))),
+            "loss"              : loss_scalar,
+            "mean_reward"       : float(np.mean(all_rewards)),
+            "std_reward"        : float(np.std(all_rewards)),
+            "mean_abs_adv"      : float(np.mean(np.abs(all_advantages))),
+            "avg_within_std"    : float(np.mean(within_group_stds)),
+            "parse_rate"        : n_parsed / max(n_total, 1),
         }
 
     # ------------------------------------------------------------------
@@ -441,15 +459,20 @@ class GRPOTrainer:
 
         t_collect = time.time()
         rollout_groups = []
+        total_parsed = 0
+        total_steps_all = 0
         for seed in seeds:
             group      = self.collect_rollouts(env, seed)
             rewards    = [round(r["total_reward"], 4) for r in group]
             steps      = [r["n_steps"] for r in group]
             n_parsed   = sum(1 for r in group for s in r["steps"] if s.get("action_parsed", False))
             n_total    = sum(r["n_steps"] for r in group)
-            # Sample the last rollout's step-0 action to check for diversity
             step0_acts = [[round(v, 2) for v in r["steps"][0]["action"]] for r in group]
-            print(f"    seed={seed}: rewards={rewards}  steps={steps}  parsed={n_parsed}/{n_total}")
+            rwd_arr    = np.array([r["total_reward"] for r in group])
+            total_parsed    += n_parsed
+            total_steps_all += n_total
+            print(f"    seed={seed}: rewards={rewards}  steps={steps}  "
+                  f"parsed={n_parsed}/{n_total}  within_std={rwd_arr.std():.3f}")
             print(f"             step0 actions: {step0_acts}")
             rollout_groups.append(group)
         collect_s = time.time() - t_collect
@@ -459,9 +482,10 @@ class GRPOTrainer:
         metrics  = self.grpo_step(rollout_groups)
         update_s = time.time() - t_update
 
-        metrics["iteration"] = iteration + 1
-        metrics["collect_s"] = round(collect_s, 1)
-        metrics["update_s"]  = round(update_s,  1)
+        metrics["iteration"]  = iteration + 1
+        metrics["collect_s"]  = round(collect_s, 1)
+        metrics["update_s"]   = round(update_s,  1)
+        metrics["parse_rate"] = total_parsed / max(total_steps_all, 1)
         return metrics
 
     # ------------------------------------------------------------------

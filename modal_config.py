@@ -103,5 +103,6 @@ rl_image = (
         "policy",        # M3: VLM policy actor
         "reward",        # M4: dense reward shaping
         "trainer",       # M5: GRPO training loop
+        "env_utils",     # shared env setup: robot base shift + random block/target
     )
 )

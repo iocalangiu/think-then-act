@@ -25,17 +25,25 @@ Run with:
 import modal
 from modal_config import app, rl_image, model_volume, MODEL_CACHE_DIR
 from env_utils import setup_env, init_random_episode
+from policy import encode_action, decode_action, N_BINS
 
 
 # ---------------------------------------------------------------------------
 # Oracle helpers
 # ---------------------------------------------------------------------------
 
-def oracle_action(obs_arr, achieved_goal, desired_goal):
-    """Scripted heuristic for FetchPickAndPlace. Returns (action, phase)."""
+def oracle_action(obs_arr, achieved_goal, desired_goal, carrying: bool = False):
+    """
+    Scripted heuristic for FetchPickAndPlace. Returns (action, phase, carrying).
+
+    `carrying` is stateful hysteresis: once the block is grasped and lifted, stay
+    in CARRY until the block clearly escapes the gripper (d_3d > 0.12).  Without
+    this, CARRY moves toward the target (which is at table height), descending the
+    block below the block_z > 0.45 threshold and causing GRASP/CARRY oscillation.
+    """
     import numpy as np
 
-    rel          = obs_arr[6:9]              # block - grip (object_rel_pos)
+    rel          = obs_arr[6:9]              # object_rel_pos = block - gripper
     finger_width = float(np.sum(obs_arr[9:11]))
 
     d_3d = float(np.linalg.norm(rel))
@@ -44,19 +52,19 @@ def oracle_action(obs_arr, achieved_goal, desired_goal):
     block_z = float(achieved_goal[2])
     grip_z  = block_z - float(rel[2])
 
-    # "lifted" = block genuinely above table surface (table ~0.4m, resting z ~0.425m)
     block_lifted  = block_z > 0.45
-    is_grasped    = block_lifted and d_3d < 0.10
-    # Hysteresis: stay in GRASP while gripper is within 10 cm above block.
-    # Prevents the open+descend ↔ close+lift 2-step oscillation.
+    # Once carrying, only exit if block escapes (wider tolerance than initial grasp).
+    is_grasped    = (block_lifted and d_3d < 0.10) or (carrying and d_3d < 0.12)
     at_block_zone = grip_z <= block_z + 0.10
 
     if is_grasped:
         phase     = "CARRY"
+        carrying  = True
         direction = np.array(desired_goal) - np.array(achieved_goal)
         grip      = -1.0                              # CLOSE — keep block grasped
     elif d_3d < 0.10 or at_block_zone:
-        phase = "GRASP"
+        phase    = "GRASP"
+        carrying = False
         if grip_z > block_z + 0.025:
             direction = np.array(rel)                 # move toward block (XY+Z)
             grip      = 1.0                           # OPEN during descent
@@ -68,10 +76,12 @@ def oracle_action(obs_arr, achieved_goal, desired_goal):
             grip      = -1.0                          # CLOSE — maintain grasp
     elif d_xy > 0.1:
         phase     = "APPROACH"
+        carrying  = False
         direction = np.array([rel[0], rel[1], 0.0])   # lateral only
         grip      = 1.0                               # OPEN
     else:
         phase     = "APPROACH"
+        carrying  = False
         direction = np.array([rel[0], rel[1], rel[2]])  # full 3D descent
         grip      = 1.0                               # OPEN
 
@@ -79,7 +89,7 @@ def oracle_action(obs_arr, achieved_goal, desired_goal):
     scale = min(1.0, float(np.linalg.norm(direction)) / 0.05)
     dx, dy, dz = (direction / norm) * scale
 
-    return np.clip([dx, dy, dz, grip], -1.0, 1.0).astype(np.float32), phase
+    return np.clip([dx, dy, dz, grip], -1.0, 1.0).astype(np.float32), phase, carrying
 
 
 def make_think_text(obs_arr, achieved_goal, desired_goal, action, phase):
@@ -191,6 +201,8 @@ def run_episode(env, seed: int, max_steps: int,
 
     examples = []
     frames   = []
+    carrying = False
+    success  = False
 
     for _ in range(max_steps):
         obs_arr       = obs["observation"]
@@ -198,8 +210,12 @@ def run_episode(env, seed: int, max_steps: int,
         desired_goal  = obs["desired_goal"]
         frame         = env.last_frame()
 
-        action, phase = oracle_action(obs_arr, achieved_goal, desired_goal)
-        think         = make_think_text(obs_arr, achieved_goal, desired_goal, action, phase)
+        action, phase, carrying = oracle_action(obs_arr, achieved_goal, desired_goal, carrying)
+        # Quantize: encode to bins then decode back so think text and env step
+        # both use the same representable value, not the raw continuous float.
+        action_bins = [encode_action(v) for v in action]
+        action_q    = np.array([decode_action(b) for b in action_bins], dtype=np.float32)
+        think       = make_think_text(obs_arr, achieved_goal, desired_goal, action_q, phase)
 
         if verbose:
             rel   = obs_arr[6:9]
@@ -208,21 +224,31 @@ def run_episode(env, seed: int, max_steps: int,
                   f"d3={np.linalg.norm(rel):.3f}m "
                   f"block_z={float(achieved_goal[2]):.3f}m "
                   f"grip_z={float(achieved_goal[2]) - float(rel[2]):.3f}m "
-                  f"fw={fw:.3f}m")
+                  f"fw={fw:.3f}m  bins={action_bins}")
 
         examples.append({
             "frame"        : frame,
+            "gripper_pos"  : obs_arr[0:3].tolist(),
             "achieved_goal": achieved_goal.tolist(),
             "desired_goal" : desired_goal.tolist(),
             "think"        : think,
-            "action"       : action.tolist(),
+            "action_bins"  : action_bins,
             "phase"        : phase,
         })
         frames.append(frame)
 
-        obs, _, terminated, truncated, _ = env.step(action)
+        obs, _, terminated, truncated, info = env.step(action_q)
+        if info.get("is_success", False):
+            success = True
+            break
         if terminated or truncated:
             break
+
+    outcome = "success" if success else "timeout"
+    if verbose:
+        print(f"  outcome={outcome}")
+    for ex in examples:
+        ex["outcome"] = outcome
 
     return examples, frames
 
@@ -259,9 +285,10 @@ def generate_sft_data(n_episodes: int = 50, max_steps: int = 50,
     )
     setup_env(env)   # shift robot base once — persists across resets
 
-    all_examples = []
-    phase_counts = {"APPROACH": 0, "GRASP": 0, "CARRY": 0}
-    skip_count   = 0
+    all_examples  = []
+    phase_counts  = {"APPROACH": 0, "GRASP": 0, "CARRY": 0}
+    skip_count    = 0
+    success_count = 0
     sample_frames = None
 
     for i in range(n_episodes):
@@ -277,13 +304,17 @@ def generate_sft_data(n_episodes: int = 50, max_steps: int = 50,
         if sample_frames is None:
             sample_frames = frames
 
+        if episode_examples[0]["outcome"] == "success":
+            success_count += 1
         for ex in episode_examples:
             phase_counts[ex["phase"]] += 1
         all_examples.extend(episode_examples)
 
         if (i + 1) % 10 == 0:
             print(f"  {i+1}/{n_episodes}  total={len(all_examples)}"
-                  f"  phases={phase_counts}  skipped={skip_count}")
+                  f"  phases={phase_counts}"
+                  f"  success={success_count}/{i+1-skip_count}"
+                  f"  skipped={skip_count}")
 
     env.close()
 
@@ -301,16 +332,21 @@ def generate_sft_data(n_episodes: int = 50, max_steps: int = 50,
 
     model_volume.commit()
 
+    n_attempted = n_episodes - skip_count
     print(f"\n  Done. {len(all_examples)} examples → {out_path}")
     print(f"  Phase distribution : {phase_counts}")
+    print(f"  Oracle success     : {success_count}/{n_attempted}"
+          f"  ({100*success_count/max(n_attempted,1):.0f}%)")
     print(f"  Skipped episodes   : {skip_count}")
     print(f"{'='*60}")
 
     return {
-        "n_examples"  : len(all_examples),
-        "phase_counts": phase_counts,
-        "skip_count"  : skip_count,
-        "output_path" : out_path,
+        "n_examples"   : len(all_examples),
+        "phase_counts" : phase_counts,
+        "success_count": success_count,
+        "n_attempted"  : n_attempted,
+        "skip_count"   : skip_count,
+        "output_path"  : out_path,
     }
 
 
