@@ -18,7 +18,8 @@ information at every step, decomposed into four components:
 
 Observation vector layout for FetchPickAndPlace (25 floats):
   obs[ 0: 3] = grip_pos          (gripper end-effector XYZ)
-  obs[ 3: 6] = object_pos        (block XYZ, same as achieved_goal)
+  obs[ 3: 6] = NOT block position in gymnasium-robotics 1.3.1 (~0.865m off —
+               use the achieved_goal parameter instead; see bugs_and_fixes memory)
   obs[ 6: 9] = object_rel_pos    (block − gripper)
   obs[ 9:11] = gripper_state     (finger widths, ~0=closed, ~0.05=open each)
   obs[11:14] = object_rot        (block rotation)
@@ -95,9 +96,13 @@ def compute_dense_reward(
 
     # ------------------------------------------------------------------
     # Extract positions from observation vector
+    #
+    # obs[3:6] is NOT the block position in gymnasium-robotics 1.3.1 (it's
+    # ~0.865m off from the real block — see bugs_and_fixes memory). Use the
+    # `achieved_goal` parameter instead, which the env guarantees is correct.
     # ------------------------------------------------------------------
     grip_pos      = obs[0:3]    # gripper end-effector XYZ
-    block_pos     = obs[3:6]    # block XYZ (redundant with achieved_goal, but convenient)
+    block_pos     = achieved    # block XYZ — from achieved_goal, NOT obs[3:6]
     gripper_state = obs[9:11]   # finger widths: ~0 each = closed, ~0.05 each = open
 
     # ------------------------------------------------------------------
