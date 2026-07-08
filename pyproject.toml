@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "think-then-act"
+version = "0.1.0"
+description = "Vision-guided sorter robot arm: VLM policy + GRPO training on Modal + MuJoCo"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:solara -m \"not integration and not gpu\""
+markers = [
+    "integration: needs mujoco/gymnasium-robotics; run via `modal run tests/run_integration.py`, not local pytest",
+    "gpu: needs torch/peft on an actual GPU (loads Qwen2-VL-2B); run via `modal run tests/run_integration.py --gpu-tests`",
+]

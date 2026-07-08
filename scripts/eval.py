@@ -4,8 +4,8 @@ eval.py
 Milestone 6B — Policy evaluation harness.
 
 Run with:
-    modal run eval.py                                                   # base model
-    modal run eval.py --checkpoint-path /model-cache/checkpoints/grpo_iter_5
+    modal run scripts/eval.py                                                   # base model
+    modal run scripts/eval.py --checkpoint-path /model-cache/checkpoints/grpo_iter_5
 
 What this does:
   1. Loads Qwen2-VL-2B-Instruct + optional LoRA checkpoint.
@@ -20,7 +20,7 @@ Download the rollout video with:
 """
 
 import modal
-from modal_config import app, rl_image, model_volume, MODEL_CACHE_DIR
+from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ def run_evaluation(
 ) -> dict:
     import os, time
     import numpy as np
-    from env_utils import save_video
+    from think_then_act.env.setup import save_video
 
     os.environ["MUJOCO_GL"]          = "osmesa"
     os.environ["PYOPENGL_PLATFORM"]  = "osmesa"
@@ -48,16 +48,14 @@ def run_evaluation(
     os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
 
     import torch
-    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
     from PIL import Image as PILImage
     from qwen_vl_utils import process_vision_info
     import gymnasium as gym
     import gymnasium_robotics  # noqa: F401
-    from obs_wrapper import ObservationHarness
-    from reward import compute_dense_reward
-    from policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, VLMPolicy
-
-    MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+    from think_then_act.env.wrapper import ObservationHarness
+    from think_then_act.reward.dense_reward import compute_dense_reward
+    from think_then_act.policy.vlm_policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, VLMPolicy
+    from think_then_act.policy.model_loader import MODEL_ID, load_base_model, load_lora_checkpoint
 
     print("\n" + "=" * 60)
     label = f"LoRA:{checkpoint_path.split('/')[-1]}" if checkpoint_path else "base (no LoRA)"
@@ -68,18 +66,11 @@ def run_evaluation(
     # 1. Load model
     # ------------------------------------------------------------------
     print("\n[1/4] Loading model...")
-    base_model = Qwen2VLForConditionalGeneration.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        cache_dir=MODEL_CACHE_DIR,
-    )
-    processor = AutoProcessor.from_pretrained(MODEL_ID, cache_dir=MODEL_CACHE_DIR)
+    base_model, processor = load_base_model(MODEL_ID, cache_dir=MODEL_CACHE_DIR)
 
     if checkpoint_path:
-        from peft import PeftModel
         print(f"  Applying LoRA from {checkpoint_path}...")
-        model = PeftModel.from_pretrained(base_model, checkpoint_path)
+        model = load_lora_checkpoint(base_model, checkpoint_path)
     else:
         model = base_model
 
@@ -112,14 +103,12 @@ def run_evaluation(
         for _ in range(max_episode_steps):
             frame = env.last_frame()
 
-            achieved = [round(v, 4) for v in current_obs["achieved_goal"]]
-            desired  = [round(v, 4) for v in current_obs["desired_goal"]]
-            distance = float(np.linalg.norm(
-                np.array(current_obs["desired_goal"])
-                - np.array(current_obs["achieved_goal"])
-            ))
-            user_text = USER_PROMPT_TEMPLATE.format(
-                achieved_goal=achieved, desired_goal=desired, distance=distance
+            obs_arr     = np.array(current_obs["observation"])
+            gripper_pos = [round(v, 4) for v in obs_arr[0:3]]
+            achieved    = [round(v, 4) for v in current_obs["achieved_goal"]]
+            desired     = [round(v, 4) for v in current_obs["desired_goal"]]
+            user_text   = USER_PROMPT_TEMPLATE.format(
+                gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
             )
             pil_image = PILImage.fromarray(frame).resize((224, 224), PILImage.LANCZOS)
             messages  = [

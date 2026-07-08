@@ -1,5 +1,5 @@
 """
-trainer.py
+think_then_act.training.grpo_trainer
 
 GRPOTrainer — Group Relative Policy Optimization for the VLM robot policy.
 
@@ -96,35 +96,21 @@ class GRPOTrainer:
 
     def _setup_model(self) -> None:
         import torch
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-        from peft import get_peft_model, LoraConfig
+        from think_then_act.policy.model_loader import load_base_model, attach_lora
 
         print(f"[GRPOTrainer] Loading base model from cache...")
-        self.base_model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.config.model_id,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            cache_dir=self.config.cache_dir,
-        )
-        self.processor = AutoProcessor.from_pretrained(
-            self.config.model_id,
-            cache_dir=self.config.cache_dir,
+        self.base_model, self.processor = load_base_model(
+            self.config.model_id, cache_dir=self.config.cache_dir,
         )
 
         print(f"[GRPOTrainer] Applying LoRA (rank={self.config.lora_rank})...")
-        lora_cfg = LoraConfig(
-            r                 = self.config.lora_rank,
-            lora_alpha        = self.config.lora_alpha,
-            target_modules    = self.config.lora_target_modules,
-            lora_dropout      = self.config.lora_dropout,
-            bias              = "none",
-            task_type         = "CAUSAL_LM",
+        self.model = attach_lora(
+            self.base_model,
+            lora_rank=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            target_modules=self.config.lora_target_modules,
         )
-        self.model = get_peft_model(self.base_model, lora_cfg)
-        # enable_input_require_grads() must come before gradient_checkpointing_enable()
-        # when using PEFT — otherwise frozen base weights break the backward graph.
-        self.model.enable_input_require_grads()
-        self.model.gradient_checkpointing_enable()
         self.model.print_trainable_parameters()
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
@@ -148,8 +134,8 @@ class GRPOTrainer:
         import torch
         from PIL import Image
         from qwen_vl_utils import process_vision_info
-        from policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, VLMPolicy
-        from reward import compute_dense_reward
+        from think_then_act.policy.vlm_policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, VLMPolicy
+        from think_then_act.reward.dense_reward import compute_dense_reward
 
         rollouts = []
 
@@ -161,7 +147,7 @@ class GRPOTrainer:
             current_obs, _ = env.reset(seed=state_seed)
 
             if self.config.randomize_env:
-                from env_utils import init_random_episode
+                from think_then_act.env.setup import init_random_episode
                 # Same rng seed for all rollouts in group → same block/target positions,
                 # different action sequences (diversity comes from temperature sampling).
                 rng = np.random.default_rng(state_seed)
@@ -309,7 +295,7 @@ class GRPOTrainer:
         import torch.nn.functional as F
         from PIL import Image
         from qwen_vl_utils import process_vision_info
-        from policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
+        from think_then_act.policy.vlm_policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
         torch.cuda.empty_cache()   # free any lingering allocations before grad forward
 
@@ -499,10 +485,8 @@ class GRPOTrainer:
 
     def load_checkpoint(self, path: str) -> None:
         import torch
-        from peft import PeftModel
-        self.model = PeftModel.from_pretrained(self.base_model, path, is_trainable=True)
-        self.model.enable_input_require_grads()
-        self.model.gradient_checkpointing_enable()
+        from think_then_act.policy.model_loader import load_lora_checkpoint
+        self.model = load_lora_checkpoint(self.base_model, path, trainable=True)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.Adam(trainable, lr=self.config.lr)
         print(f"[GRPOTrainer] LoRA checkpoint loaded ← {path}")

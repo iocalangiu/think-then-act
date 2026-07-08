@@ -6,8 +6,8 @@ HARD (oracle fails).  Saves a short MP4 per seed + an HTML report you can
 open locally in your browser to scroll / filter / sort through everything.
 
 Usage:
-    modal run analyze_seeds.py                 # 100 seeds
-    modal run analyze_seeds.py --n-seeds 200
+    modal run scripts/analyze_seeds.py                 # 100 seeds
+    modal run scripts/analyze_seeds.py --n-seeds 200
 
 Download + view:
     modal volume get rl-harness-model-cache seed_analysis/ ./seed_analysis/
@@ -19,7 +19,7 @@ Keyboard navigation in the report:
 """
 
 import modal
-from modal_config import app, rl_image, model_volume, MODEL_CACHE_DIR
+from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DIR
 
 
 @app.function(
@@ -37,8 +37,8 @@ def analyze_seeds(n_seeds: int = 100, fps: int = 10, max_steps: int = 50) -> dic
 
     import gymnasium as gym
     import gymnasium_robotics  # noqa
-    from obs_wrapper import ObservationHarness
-    from env_utils import setup_env, init_random_episode, save_video
+    from think_then_act.env.wrapper import ObservationHarness
+    from think_then_act.env.setup import setup_env, init_random_episode, save_video
 
     out_dir = os.path.join(MODEL_CACHE_DIR, "seed_analysis")
     os.makedirs(out_dir, exist_ok=True)

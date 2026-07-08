@@ -17,15 +17,15 @@ Each row in sft_data.jsonl is one training example:
     phase       — APPROACH | GRASP | CARRY
 
 Run with:
-    modal run generate_sft_data.py                          # 50 episodes
-    modal run generate_sft_data.py --n-episodes 100
-    modal run generate_sft_data.py --debug                  # 1 episode, verbose
+    modal run scripts/generate_sft_data.py                          # 50 episodes
+    modal run scripts/generate_sft_data.py --n-episodes 100
+    modal run scripts/generate_sft_data.py --debug                  # 1 episode, verbose
 """
 
 import modal
-from modal_config import app, rl_image, model_volume, MODEL_CACHE_DIR
-from env_utils import setup_env, init_random_episode
-from policy import encode_action, decode_action, N_BINS
+from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DIR
+from think_then_act.env.setup import setup_env, init_random_episode
+from think_then_act.policy.vlm_policy import encode_action, decode_action, N_BINS
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ def generate_sft_data(n_episodes: int = 50, max_steps: int = 50,
 
     import gymnasium as gym
     import gymnasium_robotics  # noqa: F401
-    from obs_wrapper import ObservationHarness
+    from think_then_act.env.wrapper import ObservationHarness
 
     print(f"\n{'='*60}")
     print(f"  SFT DATA GENERATION — {n_episodes} episodes × {max_steps} steps")

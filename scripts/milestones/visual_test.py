@@ -7,12 +7,12 @@ and asks it to locate the block, target, and gripper.
 Reads the first frame from sft_data.jsonl so we use an actual scene.
 
 Run with:
-    modal run visual_test.py
-    modal run visual_test.py --frame-index 10   # try a different frame
+    modal run scripts/milestones/visual_test.py
+    modal run scripts/milestones/visual_test.py --frame-index 10   # try a different frame
 """
 
 import modal
-from modal_config import app, rl_image, model_volume, MODEL_CACHE_DIR
+from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DIR
 
 
 @app.function(
@@ -25,8 +25,8 @@ def query_frame(frame_index: int = 0) -> dict:
     import os, json, base64, io
     import torch
     from PIL import Image
-    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
     from qwen_vl_utils import process_vision_info
+    from think_then_act.policy.model_loader import MODEL_ID, load_base_model
 
     os.environ["HF_HOME"]            = MODEL_CACHE_DIR
     os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE_DIR
@@ -57,16 +57,7 @@ def query_frame(frame_index: int = 0) -> dict:
     # Load base model — no SFT, no LoRA
     # ------------------------------------------------------------------
     print("\nLoading Qwen2-VL-2B-Instruct (base)...")
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen2-VL-2B-Instruct",
-        torch_dtype=torch.float16,
-        device_map="auto",
-        cache_dir=MODEL_CACHE_DIR,
-    )
-    processor = AutoProcessor.from_pretrained(
-        "Qwen/Qwen2-VL-2B-Instruct",
-        cache_dir=MODEL_CACHE_DIR,
-    )
+    model, processor = load_base_model(MODEL_ID, cache_dir=MODEL_CACHE_DIR)
     model.eval()
 
     # ------------------------------------------------------------------

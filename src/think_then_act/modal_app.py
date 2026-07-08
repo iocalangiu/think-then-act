@@ -1,8 +1,8 @@
 """
-modal_config.py
+think_then_act.modal_app
 
 Central Modal image definition for the rl_harness_robotics project.
-Import `app`, `rl_image`, and `model_volume` from this file in every
+Import `app`, `rl_image`, and `model_volume` from this module in every
 other Modal script so all functions share one consistent environment.
 
 MuJoCo on a headless server needs:
@@ -93,16 +93,13 @@ rl_image = (
         "wandb>=0.17.0",
     )
 
-    # --- Layer 4: local project modules ---
+    # --- Layer 4: local project package ---
     # modal.Mount was removed in Modal 1.x.  add_local_python_source()
     # bakes local .py files into the image so containers can import them.
-    # Add every new project module here as the project grows.
-    .add_local_python_source(
-        "modal_config",  # M1: app + image + volume definitions
-        "obs_wrapper",   # M2: RGB frame capture + episode harness
-        "policy",        # M3: VLM policy actor
-        "reward",        # M4: dense reward shaping
-        "trainer",       # M5: GRPO training loop
-        "env_utils",     # shared env setup: robot base shift + random block/target
-    )
+    # Bake the whole think_then_act package — new submodules just work,
+    # no per-module list to maintain.
+    # copy=True: without it, Modal defers this to a runtime file-mount and
+    # forbids any further build steps (e.g. tests/run_integration.py's
+    # extra .pip_install("pytest")) after this point in the chain.
+    .add_local_python_source("think_then_act", copy=True)
 )

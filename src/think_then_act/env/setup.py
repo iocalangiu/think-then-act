@@ -1,7 +1,7 @@
 """
-env_utils.py
+think_then_act.env.setup
 
-Shared environment setup helpers used by both generate_sft_data.py and trainer.py.
+Shared environment setup helpers used across data generation, training, and eval scripts.
 
 All functions assume FetchPickAndPlace-v3 wrapped in ObservationHarness.
 """

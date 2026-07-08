@@ -17,9 +17,12 @@ import modal
 from think_then_act.modal_app import MODEL_CACHE_DIR, app, model_volume, rl_image
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = TESTS_DIR.parent
 
-test_image = rl_image.pip_install("pytest==8.2.2").add_local_dir(
-    str(TESTS_DIR), remote_path="/root/tests"
+test_image = (
+    rl_image.pip_install("pytest==8.2.2")
+    .add_local_dir(str(TESTS_DIR), remote_path="/root/tests")
+    .add_local_file(str(REPO_ROOT / "pyproject.toml"), remote_path="/root/pyproject.toml")
 )
 
 
@@ -29,7 +32,8 @@ def run_cpu_tests() -> int:
     import sys
 
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "/root/tests/integration", "-v", "-m", "integration and not gpu"],
+        [sys.executable, "-m", "pytest", "tests/integration", "-v", "-m", "integration and not gpu"],
+        cwd="/root",
     )
     return result.returncode
 
@@ -42,7 +46,8 @@ def run_gpu_tests() -> int:
 
     env = {**os.environ, "MODEL_CACHE_DIR": MODEL_CACHE_DIR}
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "/root/tests/integration", "-v", "-m", "gpu"],
+        [sys.executable, "-m", "pytest", "tests/integration", "-v", "-m", "gpu"],
+        cwd="/root",
         env=env,
     )
     return result.returncode

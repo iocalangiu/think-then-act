@@ -1,5 +1,5 @@
 """
-obs_wrapper.py
+think_then_act.env.wrapper
 
 Custom gymnasium.Wrapper that augments FetchPickAndPlace-v3 (or any
 dict-observation robotics env) with:

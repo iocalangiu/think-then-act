@@ -1,5 +1,5 @@
 """
-reward.py
+think_then_act.reward.dense_reward
 
 Dense reward shaping for FetchPickAndPlace-v3.
 

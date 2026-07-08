@@ -1,5 +1,5 @@
 """
-policy.py
+think_then_act.policy.vlm_policy
 
 VLMPolicy — the vision-language model policy actor for the robot arm.
 
@@ -109,33 +109,18 @@ class VLMPolicy:
         max_new_tokens: int = 256,
         device: str = "cuda",
     ) -> None:
-        import torch
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        from think_then_act.policy.model_loader import load_base_model, load_lora_checkpoint
 
         print(f"[VLMPolicy] Loading {model_id}...")
         print(f"[VLMPolicy] Cache dir: {cache_dir or 'HuggingFace default'}")
 
-        load_kwargs: dict = {
-            "torch_dtype" : torch.float16,  # fp16 halves VRAM usage vs fp32
-            "device_map"  : "auto",          # lets accelerate place layers on GPU
-        }
-        if cache_dir:
-            load_kwargs["cache_dir"] = cache_dir
-
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_id, **load_kwargs
-        )
+        self.model, self.processor = load_base_model(model_id, cache_dir=cache_dir)
 
         if lora_path:
-            from peft import PeftModel
             print(f"[VLMPolicy] Loading LoRA adapter from {lora_path}...")
-            self.model = PeftModel.from_pretrained(self.model, lora_path)
+            self.model = load_lora_checkpoint(self.model, lora_path)
             print("[VLMPolicy] LoRA adapter loaded.")
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_id,
-            **({} if cache_dir is None else {"cache_dir": cache_dir}),
-        )
         self.max_new_tokens = max_new_tokens
         self.device = device
         print("[VLMPolicy] Model loaded and ready.")

@@ -4,7 +4,7 @@ verify_mujoco.py
 Milestone 1 verification script.
 
 Run with:
-    modal run verify_mujoco.py
+    modal run scripts/milestones/verify_mujoco.py
 
 What this does:
   1. Boots our Modal cloud container (the `rl_image` we defined in modal_config.py).
@@ -20,7 +20,7 @@ What this does:
 """
 
 import modal
-from modal_config import app, rl_image
+from think_then_act.modal_app import app, rl_image
 
 # ---------------------------------------------------------------------------
 # The @app.function decorator tells Modal:
@@ -172,7 +172,7 @@ def verify_headless_mujoco() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint: called when you run `modal run verify_mujoco.py`
+# Local entrypoint: called when you run `modal run scripts/milestones/verify_mujoco.py`
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
 def main():
