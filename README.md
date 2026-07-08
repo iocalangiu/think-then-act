@@ -61,14 +61,28 @@ Two memory constraints shaped the implementation:
 ## Project structure
 
 ```
-modal_config.py   — container image, Modal app, persistent volume
-obs_wrapper.py    — gymnasium wrapper: captures RGB frames + episode log
-policy.py         — VLMPolicy: prompt builder, generator, response parser
-reward.py         — dense reward function (gripper distance, grasp, placement)
-trainer.py        — GRPOTrainer: rollout collection, log-prob computation, gradient step
-eval.py           — evaluation harness: runs N episodes, saves rollout video
-run_train_m6.py   — full training run (50–100 iterations, checkpoints, interleaved eval)
+src/think_then_act/
+  modal_app.py             — container image, Modal app, persistent volume
+  env/wrapper.py           — gymnasium wrapper: captures RGB frames + episode log
+  env/setup.py             — shared env setup: robot base shift, random block/target, video I/O
+  policy/vlm_policy.py     — VLMPolicy: prompt builder, generator, response parser
+  policy/model_loader.py   — shared Qwen2-VL + LoRA loading (base model, attach LoRA, load checkpoint)
+  reward/dense_reward.py   — dense reward function (gripper distance, grasp, placement)
+  training/grpo_trainer.py — GRPOTrainer: rollout collection, log-prob computation, gradient step
+
+scripts/
+  eval.py                  — evaluation harness: runs N episodes, saves rollout video
+  run_train_m6.py          — full training run (50–100 iterations, checkpoints, interleaved eval)
+  run_episode.py           — single-episode rollout + diagnostic dump
+  sft_train.py             — SFT warm-start fine-tuning before GRPO
+  generate_sft_data.py     — oracle-generated SFT training examples
+  analyze_seeds.py         — classify seeds as GOOD/HARD via oracle rollouts
+  compare_runs.py          — compare two grpo_m6c_metrics*.jsonl logs side by side
+  milestones/              — early milestone scripts (M1–M5), kept for reference; superseded
+                             by run_train_m6.py + eval.py
 ```
+
+Installed as an editable package (`pip install -e .`) so the above import as `think_then_act.*` both locally and inside the Modal container image.
 
 ---
 
@@ -76,15 +90,31 @@ run_train_m6.py   — full training run (50–100 iterations, checkpoints, inter
 
 **Training (50 iterations):**
 ```bash
-modal run --detach run_train_m6.py
+modal run --detach scripts/run_train_m6.py
 ```
 
 **Evaluation against a checkpoint:**
 ```bash
-modal run eval.py --checkpoint-path /model-cache/checkpoints/grpo_m6c_final
+modal run scripts/eval.py --checkpoint-path /model-cache/checkpoints/grpo_m6c_final
 ```
 
 **Download rollout video:**
 ```bash
 modal volume get rl-harness-model-cache eval_rollout.mp4 ./eval_rollout.mp4
+```
+
+---
+
+## Testing
+
+**Unit tests** (pure logic — reward math, prompt/action parsing — no mujoco/torch, run locally):
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+**Integration tests** (need mujoco/gymnasium-robotics, and for the GPU one, torch/peft — run inside the Modal container):
+```bash
+modal run tests/run_integration.py                # env + reward, real MuJoCo physics (CPU)
+modal run tests/run_integration.py --gpu-tests     # + loads Qwen2-VL-2B on a GPU (costs more, run sparingly)
 ```
