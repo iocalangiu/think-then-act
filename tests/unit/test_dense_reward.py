@@ -58,9 +58,16 @@ def test_grasp_bonus_requires_both_proximity_and_closed_gripper():
     _, near_open_bd = compute_dense_reward(near_open, block, target, {"is_success": False})
     _, far_closed_bd = compute_dense_reward(far_closed, block, target, {"is_success": False})
 
+    # At d_grip_block=0 the exponential proximity term is exactly 1.0, so
+    # this still equals w_grasp exactly.
     assert near_closed_bd["r_grasp"] == pytest.approx(DEFAULT_WEIGHTS.w_grasp)
+    # Open gripper zeroes the bonus regardless of proximity (closedness=0).
     assert near_open_bd["r_grasp"] == pytest.approx(0.0)
-    assert far_closed_bd["r_grasp"] == pytest.approx(0.0)
+    # Proximity is now continuous (exponential falloff), not a hard radius
+    # gate, so "far" no longer means exactly zero — it means negligible
+    # relative to "near".
+    assert far_closed_bd["r_grasp"] > 0.0
+    assert far_closed_bd["r_grasp"] < near_closed_bd["r_grasp"] * 0.01
 
 
 def test_success_bonus_only_applied_when_flagged():
