@@ -10,7 +10,7 @@ Usage:
     modal run scripts/analyze_seeds.py --n-seeds 200
 
 Download + view:
-    modal volume get rl-harness-model-cache seed_analysis/ ./seed_analysis/
+    modal volume get rl-harness-model-cache seed_analysis/ ./artifacts/seed_analysis/
     open seed_analysis/report.html
 
 Keyboard navigation in the report:
@@ -174,7 +174,7 @@ def analyze_seeds(n_seeds: int = 100, fps: int = 10, max_steps: int = 50) -> dic
 
     model_volume.commit()
     print(f"\nSaved → /model-cache/seed_analysis/")
-    print(f"Download: modal volume get rl-harness-model-cache seed_analysis/ ./seed_analysis/")
+    print(f"Download: modal volume get rl-harness-model-cache seed_analysis/ ./artifacts/seed_analysis/")
     print(f"View:     open seed_analysis/report.html")
 
     return {"n_good": n_good, "n_hard": n_hard, "n_total": len(results)}
@@ -384,6 +384,6 @@ def main(n_seeds: int = 100):
     print(f"\nDone: {result['n_good']}/{result['n_total']} GOOD  "
           f"{result['n_hard']}/{result['n_total']} HARD")
     print(f"\nDownload:")
-    print(f"  modal volume get rl-harness-model-cache seed_analysis/ ./seed_analysis/")
+    print(f"  modal volume get rl-harness-model-cache seed_analysis/ ./artifacts/seed_analysis/")
     print(f"View:")
     print(f"  open seed_analysis/report.html")
