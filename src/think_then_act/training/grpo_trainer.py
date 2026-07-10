@@ -38,6 +38,9 @@ class GRPOConfig:
     # Model
     model_id     : str = "Qwen/Qwen2-VL-2B-Instruct"
     cache_dir    : str = "/model-cache"
+    # NF4 quantized base (QLoRA) — generation is memory-bandwidth-bound, so
+    # this speeds up rollout collection on top of batching, not just VRAM.
+    load_in_4bit : bool = True
 
     # LoRA adapter
     lora_rank    : int  = 8
@@ -66,6 +69,16 @@ class GRPOConfig:
     # Optimisation
     lr            : float = 5e-5
     max_grad_norm : float = 1.0
+
+    # Entropy regularization: loss += -entropy_coef * H(pi_theta), computed over
+    # the response-token distribution at each generated position (mean per token).
+    # Subtracting an entropy bonus from a loss-to-minimize is equivalent to adding
+    # it to the maximized objective — pushes the policy away from a deterministic
+    # collapse onto whatever action it first found, without a KL-to-reference term.
+    # Set to 0.0 to disable. Too high → outputs drift toward incoherent/unparseable
+    # text; too low → GRPO's existing mode-collapse tendency (see reward_noise_std
+    # above, which was a workaround for the same symptom) goes unchecked.
+    entropy_coef  : float = 0.01
 
     def as_dict(self) -> dict:
         return {k: v for k, v in vars(self).items()
@@ -98,9 +111,11 @@ class GRPOTrainer:
         import torch
         from think_then_act.policy.model_loader import load_base_model, attach_lora
 
-        print(f"[GRPOTrainer] Loading base model from cache...")
+        print(f"[GRPOTrainer] Loading base model from cache "
+              f"(4bit={self.config.load_in_4bit})...")
         self.base_model, self.processor = load_base_model(
             self.config.model_id, cache_dir=self.config.cache_dir,
+            load_in_4bit=self.config.load_in_4bit,
         )
 
         print(f"[GRPOTrainer] Applying LoRA (rank={self.config.lora_rank})...")
@@ -115,18 +130,36 @@ class GRPOTrainer:
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.Adam(trainable, lr=self.config.lr)
+
+        # Left-padding is required for batched generate(): it pads every row
+        # to the same length by adding tokens on the LEFT, so every row's
+        # real prompt content ends at the same column and one slice recovers
+        # each row's newly generated tokens (see collect_rollouts). _step_log_prob
+        # is unaffected — it always runs at batch size 1, where padding side
+        # is a no-op.
+        self.processor.tokenizer.padding_side = "left"
+
         print("[GRPOTrainer] Ready.\n")
 
     # ------------------------------------------------------------------
     # Rollout collection (no gradient)
     # ------------------------------------------------------------------
 
-    def collect_rollouts(self, env, state_seed: int) -> list[dict]:
+    def collect_rollouts(self, envs: list, state_seed: int) -> list[dict]:
         """
-        Reset env to `state_seed`, then run group_size full-episode rollouts.
+        Reset `group_size` independent envs to `state_seed`, then run all
+        group_size rollouts in lockstep, batching every still-running
+        rollout's prompt into a SINGLE model.generate() call per step_num
+        instead of group_size sequential calls.
 
-        Each rollout runs up to max_episode_steps steps (or until the env
-        signals terminated/truncated).  Returns a list of rollout dicts:
+        Autoregressive decoding at batch=1 is memory-bandwidth-bound (loading
+        weights per token dominates over compute), so a GPU spends most of
+        its time idle doing group_size separate single-sequence decodes.
+        Batching amortizes the weight load across rows — this is where
+        iteration wall-clock was almost entirely going (collect_s >> update_s
+        in the M6C run logs).
+
+        Returns the same shape as before: a list of rollout dicts
             steps        : list of per-step dicts (frame, state_entry, response, …)
             total_reward : sum of dense rewards across the episode
             n_steps      : number of steps actually taken
@@ -136,62 +169,86 @@ class GRPOTrainer:
         from qwen_vl_utils import process_vision_info
         from think_then_act.policy.vlm_policy import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, VLMPolicy
         from think_then_act.reward.dense_reward import compute_dense_reward
+        from think_then_act.env.setup import init_random_episode
 
-        rollouts = []
+        G = self.config.group_size
+        assert len(envs) == G, f"collect_rollouts needs group_size={G} envs, got {len(envs)}"
 
-        for g in range(self.config.group_size):
-            _logged_failure = False   # print at most one failed response per rollout
-            # Unique CUDA seed per rollout; env.reset(seed=...) may reset torch RNG.
-            torch.cuda.manual_seed(state_seed * 10_000 + g * 100)
+        # A single batched generate() call draws independent random samples
+        # per row from one CUDA RNG stream, so within-group diversity no
+        # longer needs a distinct manual_seed per rollout (that was only ever
+        # a diversity mechanism, not a correctness requirement) — the
+        # per-rollout pixel noise below already breaks input-level symmetry.
+        torch.cuda.manual_seed(state_seed * 10_000)
 
-            current_obs, _ = env.reset(seed=state_seed)
-
+        current_obs = []
+        for env in envs:
+            obs, _ = env.reset(seed=state_seed)
             if self.config.randomize_env:
-                from think_then_act.env.setup import init_random_episode
                 # Same rng seed for all rollouts in group → same block/target positions,
                 # different action sequences (diversity comes from temperature sampling).
                 rng = np.random.default_rng(state_seed)
-                current_obs, ok = init_random_episode(env, rng)
+                obs, ok = init_random_episode(env, rng)
                 if not ok:
-                    current_obs, _ = env.reset(seed=state_seed)  # fallback
+                    obs, _ = env.reset(seed=state_seed)  # fallback
+            current_obs.append(obs)
 
-            episode_steps  = []
-            total_reward   = 0.0
+        episode_steps  = [[] for _ in range(G)]
+        done           = [False] * G
+        logged_failure = [False] * G
 
+        # eval() disables gradient checkpointing's forced use_cache=False (it
+        # only kicks in when self.training=True), so generate() gets its
+        # KV-cache back — quick_eval() already does this correctly, but
+        # collect_rollouts never did, meaning every rollout-collection
+        # generate() call in this project's history has been recomputing
+        # attention over the whole growing sequence at each new token
+        # instead of reusing cached keys/values. Must restore train() before
+        # returning so grpo_step's backward pass still gets gradient
+        # checkpointing's memory savings.
+        self.model.eval()
+        try:
             for step_num in range(self.config.max_episode_steps):
-                frame = env.last_frame()   # current visual state (before this action)
+                active = [g for g in range(G) if not done[g]]
+                if not active:
+                    break
 
-                # Build VLM prompt from current observation.
-                obs_arr     = current_obs["observation"]
-                gripper_pos = [round(v, 4) for v in obs_arr[0:3]]
-                achieved    = [round(v, 4) for v in current_obs["achieved_goal"]]
-                desired     = [round(v, 4) for v in current_obs["desired_goal"]]
-                user_text   = USER_PROMPT_TEMPLATE.format(
-                    gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
-                )
-                # 224×224: ~64 visual tokens vs ~289 at 480×480; critical for grad memory.
-                # Per-rollout pixel noise breaks within-group mode collapse: same visual
-                # state → different tokens → different generation paths → diverse log_probs.
-                noise_rng  = np.random.default_rng(state_seed * 10_000 + g * 100 + step_num)
-                frame_noisy = np.clip(
-                    frame.astype(np.int32) + noise_rng.integers(-8, 9, frame.shape),
-                    0, 255,
-                ).astype(np.uint8)
-                pil_image = Image.fromarray(frame_noisy).resize((224, 224), Image.LANCZOS)
-                messages  = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": [
-                        {"type": "image", "image": pil_image},
-                        {"type": "text",  "text": user_text},
-                    ]},
+                # Build one batch entry per still-running rollout.
+                pil_images, messages_batch = [], []
+                for g in active:
+                    frame       = envs[g].last_frame()   # current visual state (before this action)
+                    obs_arr     = current_obs[g]["observation"]
+                    gripper_pos = [round(v, 4) for v in obs_arr[0:3]]
+                    achieved    = [round(v, 4) for v in current_obs[g]["achieved_goal"]]
+                    desired     = [round(v, 4) for v in current_obs[g]["desired_goal"]]
+                    user_text   = USER_PROMPT_TEMPLATE.format(
+                        gripper_pos=gripper_pos, achieved_goal=achieved, desired_goal=desired,
+                    )
+                    # 224×224: ~64 visual tokens vs ~289 at 480×480; critical for grad memory.
+                    # Per-rollout pixel noise breaks within-group mode collapse: same visual
+                    # state → different tokens → different generation paths → diverse log_probs.
+                    noise_rng  = np.random.default_rng(state_seed * 10_000 + g * 100 + step_num)
+                    frame_noisy = np.clip(
+                        frame.astype(np.int32) + noise_rng.integers(-8, 9, frame.shape),
+                        0, 255,
+                    ).astype(np.uint8)
+                    pil_image = Image.fromarray(frame_noisy).resize((224, 224), Image.LANCZOS)
+                    pil_images.append(pil_image)
+                    messages_batch.append([
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": [
+                            {"type": "image", "image": pil_image},
+                            {"type": "text",  "text": user_text},
+                        ]},
+                    ])
+
+                text_inputs = [
+                    self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+                    for m in messages_batch
                 ]
-
-                text_input     = self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                img_inputs, vid_inputs = process_vision_info(messages)
+                img_inputs, vid_inputs = process_vision_info(messages_batch)
                 inputs = self.processor(
-                    text=[text_input], images=img_inputs, videos=vid_inputs,
+                    text=text_inputs, images=img_inputs, videos=vid_inputs,
                     return_tensors="pt", padding=True,
                 ).to("cuda")
 
@@ -206,50 +263,63 @@ class GRPOTrainer:
                         tokenizer=self.processor.tokenizer,
                     )
 
-                gen_ids  = [o[len(i):] for i, o in zip(inputs["input_ids"], out_ids)]
-                n_gen_tokens = len(gen_ids[0])
-                response = self.processor.batch_decode(
+                # Left-padding means every row's real prompt ends at the same
+                # column (inputs["input_ids"].shape[1]), so this one slice
+                # recovers each row's generated tokens regardless of that row's
+                # own real prompt length.
+                prompt_len = inputs["input_ids"].shape[1]
+                gen_ids    = out_ids[:, prompt_len:]
+                responses  = self.processor.batch_decode(
                     gen_ids, skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
-                )[0]
-
-                action, action_found = VLMPolicy._parse_action(response)
-                if not action_found:
-                    if not _logged_failure:
-                        _logged_failure = True
-                        preview = response.replace("\n", " ")[:220]
-                        print(f"      [parse FAIL] g={g} step={step_num} "
-                              f"tokens={n_gen_tokens}  |  {preview!r}")
-                    # Seeded random fallback keeps rollout diversity when tag is absent.
-                    rng    = np.random.default_rng(state_seed * 10_000 + g * 100 + step_num)
-                    action = rng.uniform(-1.0, 1.0, size=4).astype(np.float32)
-
-                next_obs, _, terminated, truncated, info2 = env.step(action)
-                step_reward, breakdown = compute_dense_reward(
-                    obs           = next_obs["observation"],
-                    achieved_goal = next_obs["achieved_goal"],
-                    desired_goal  = next_obs["desired_goal"],
-                    info          = info2,
                 )
-                total_reward += step_reward
 
-                episode_steps.append({
-                    "frame"       : np.array(pil_image),   # 224×224 uint8
-                    "state_entry" : {                       # pre-action obs for prompt rebuild
-                        "observation"  : np.array(current_obs["observation"]),
-                        "achieved_goal": np.array(current_obs["achieved_goal"]),
-                        "desired_goal" : np.array(current_obs["desired_goal"]),
-                    },
-                    "response"     : response,
-                    "action"       : action.tolist(),
-                    "action_parsed": action_found,
-                    "step_reward"  : step_reward,
-                })
+                pad_id = self.processor.tokenizer.pad_token_id
+                for row, g in enumerate(active):
+                    response     = responses[row]
+                    n_gen_tokens = int((gen_ids[row] != pad_id).sum().item())
 
-                current_obs = next_obs
-                if terminated or truncated:
-                    break
+                    action, action_found = VLMPolicy._parse_action(response)
+                    if not action_found:
+                        if not logged_failure[g]:
+                            logged_failure[g] = True
+                            preview = response.replace("\n", " ")[:220]
+                            print(f"      [parse FAIL] g={g} step={step_num} "
+                                  f"tokens={n_gen_tokens}  |  {preview!r}")
+                        # Seeded random fallback keeps rollout diversity when tag is absent.
+                        rng    = np.random.default_rng(state_seed * 10_000 + g * 100 + step_num)
+                        action = rng.uniform(-1.0, 1.0, size=4).astype(np.float32)
 
+                    next_obs, _, terminated, truncated, info2 = envs[g].step(action)
+                    step_reward, breakdown = compute_dense_reward(
+                        obs           = next_obs["observation"],
+                        achieved_goal = next_obs["achieved_goal"],
+                        desired_goal  = next_obs["desired_goal"],
+                        info          = info2,
+                    )
+
+                    episode_steps[g].append({
+                        "frame"       : np.array(pil_images[row]),   # 224×224 uint8
+                        "state_entry" : {                       # pre-action obs for prompt rebuild
+                            "observation"  : np.array(current_obs[g]["observation"]),
+                            "achieved_goal": np.array(current_obs[g]["achieved_goal"]),
+                            "desired_goal" : np.array(current_obs[g]["desired_goal"]),
+                        },
+                        "response"     : response,
+                        "action"       : action.tolist(),
+                        "action_parsed": action_found,
+                        "step_reward"  : step_reward,
+                    })
+
+                    current_obs[g] = next_obs
+                    if terminated or truncated:
+                        done[g] = True
+        finally:
+            self.model.train()
+
+        rollouts = []
+        for g in range(G):
+            total_reward = sum(s["step_reward"] for s in episode_steps[g])
             # Small reward noise ensures non-zero within-group variance while the policy
             # is mode-collapsed.  Set reward_noise_std=0 once actions genuinely differ.
             if self.config.reward_noise_std > 0:
@@ -257,9 +327,9 @@ class GRPOTrainer:
                 total_reward += float(rng.normal(0.0, self.config.reward_noise_std))
 
             rollouts.append({
-                "steps"        : episode_steps,
+                "steps"        : episode_steps[g],
                 "total_reward" : total_reward,
-                "n_steps"      : len(episode_steps),
+                "n_steps"      : len(episode_steps[g]),
             })
 
         return rollouts
@@ -274,18 +344,21 @@ class GRPOTrainer:
 
         Gradient accumulation is handled at the STEP level in grpo_step
         (backward called per step), so this method is not called directly —
-        grpo_step iterates rollout["steps"] and calls _step_log_prob.
+        grpo_step iterates rollout["steps"] and calls _step_log_prob_and_entropy.
         This method exists for clarity / testing.
         """
         import torch
         total = torch.tensor(0.0, device="cuda")
         for step in rollout["steps"]:
-            total = total + self._step_log_prob(step)
+            log_prob, _entropy = self._step_log_prob_and_entropy(step)
+            total = total + log_prob
         return total
 
-    def _step_log_prob(self, step: dict) -> "torch.Tensor":
+    def _step_log_prob_and_entropy(self, step: dict) -> tuple:
         """
-        Differentiable log probability of the response tokens for one step.
+        Differentiable (log probability, mean token entropy) of the response
+        tokens for one step. Both come from the same forward pass / logits —
+        entropy is free once log_prob is computed, no extra model call.
 
         Rebuilds inputs from the stored (frame, state_entry, response) rather
         than storing CUDA tensors in the rollout — prevents memory leaks between
@@ -352,7 +425,14 @@ class GRPOTrainer:
             2, resp_token_ids.unsqueeze(-1)
         ).squeeze(-1)
 
-        return token_log_probs.sum(dim=-1).squeeze()
+        # Full-distribution entropy per response position (not just the sampled
+        # token) — H = -sum_v p(v) log p(v), averaged over response length so it
+        # doesn't scale with how many tokens the response happened to use.
+        probs         = log_probs.exp()
+        token_entropy = -(probs * log_probs).sum(dim=-1)
+        mean_entropy  = token_entropy.mean(dim=-1).squeeze()
+
+        return token_log_probs.sum(dim=-1).squeeze(), mean_entropy
 
     # ------------------------------------------------------------------
     # GRPO gradient step
@@ -379,7 +459,11 @@ class GRPOTrainer:
         all_rewards    : list[float] = []
         all_advantages : list[float] = []
         loss_scalar    : float       = 0.0
+        policy_loss_scalar : float   = 0.0
+        entropy_sum    : float       = 0.0
+        entropy_count  : int         = 0
         total_rollouts : int         = sum(len(g) for g in rollout_groups)
+        beta           : float       = self.config.entropy_coef
 
         within_group_stds : list[float] = []
 
@@ -398,9 +482,15 @@ class GRPOTrainer:
                 # Summing step log_probs before backward would hold all graphs at once
                 # and OOM on A10G for multi-step episodes with a 2B VLM.
                 for step in rollout["steps"]:
-                    step_lp   = self._step_log_prob(step)
-                    step_loss = (-adv_t * step_lp) / total_rollouts
-                    loss_scalar += float(step_loss.item())
+                    step_lp, step_entropy = self._step_log_prob_and_entropy(step)
+                    policy_loss  = (-adv_t * step_lp) / total_rollouts
+                    # Subtracting the entropy bonus from the loss-to-minimize is
+                    # equivalent to adding beta*H to the maximized objective.
+                    step_loss    = policy_loss - (beta * step_entropy) / total_rollouts
+                    policy_loss_scalar += float(policy_loss.item())
+                    loss_scalar        += float(step_loss.item())
+                    entropy_sum         += float(step_entropy.item())
+                    entropy_count       += 1
                     step_loss.backward()
                     torch.cuda.empty_cache()
 
@@ -420,6 +510,8 @@ class GRPOTrainer:
 
         return {
             "loss"              : loss_scalar,
+            "policy_loss"       : policy_loss_scalar,
+            "mean_entropy"      : entropy_sum / max(entropy_count, 1),
             "mean_reward"       : float(np.mean(all_rewards)),
             "std_reward"        : float(np.std(all_rewards)),
             "mean_abs_adv"      : float(np.mean(np.abs(all_advantages))),
@@ -431,8 +523,14 @@ class GRPOTrainer:
     # One full training iteration
     # ------------------------------------------------------------------
 
-    def train_iteration(self, env, iteration: int) -> dict:
-        """Collect rollouts for n_states states, then do one GRPO update."""
+    def train_iteration(self, envs: list, iteration: int) -> dict:
+        """
+        Collect rollouts for n_states states, then do one GRPO update.
+
+        envs must be a list of group_size independent, pre-configured
+        environments (see collect_rollouts) — reused across iterations by
+        the caller, reset internally on every call.
+        """
         import time
 
         seeds = [
@@ -448,7 +546,7 @@ class GRPOTrainer:
         total_parsed = 0
         total_steps_all = 0
         for seed in seeds:
-            group      = self.collect_rollouts(env, seed)
+            group      = self.collect_rollouts(envs, seed)
             rewards    = [round(r["total_reward"], 4) for r in group]
             steps      = [r["n_steps"] for r in group]
             n_parsed   = sum(1 for r in group for s in r["steps"] if s.get("action_parsed", False))

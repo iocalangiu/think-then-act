@@ -89,6 +89,8 @@ rl_image = (
         "Pillow==10.4.0",
         # LoRA fine-tuning — M5 GRPO trainer
         "peft==0.12.0",
+        # 4-bit (NF4) base model quantization — QLoRA, faster generation
+        "bitsandbytes==0.43.3",
         # Experiment tracking — M6C training run
         "wandb>=0.17.0",
     )
