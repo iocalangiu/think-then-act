@@ -28,6 +28,17 @@ Run with:
                                                               # for a quick sanity check
                                                               # before a long parallel run
     modal run --detach scripts/train_low_level_ppo.py --resume
+    modal run --detach scripts/train_low_level_ppo.py --subgoals close_gripper,lift,move_to_target,release
+                                                              # skip subgoals already
+                                                              # finished in an earlier run
+
+Early stopping: a subgoal stops (and moves to the next) once completion_rate
+holds >= --early-stop-threshold (default 1.0) for --early-stop-patience
+(default 2) CONSECUTIVE eval checkpoints — not just one, since a single
+checkpoint's completion_rate is an eval over only `eval_episodes` (default
+10) seeds and can be a fluke (seen with GRPO: a lone 10% blip that reverted
+next checkpoint). Pass --early-stop-patience 0 to disable and always run
+the full --n-iterations.
 
 Download checkpoints with:
     python3 -m modal volume get rl-harness-model-cache checkpoints/ ./artifacts/checkpoints/
@@ -63,6 +74,9 @@ def train_low_level_ppo(
     clip_eps: float = 0.0,     # 0 = default (0.2)
     n_epochs: int = 0,         # 0 = default (4)
     minibatch_size: int = 0,   # 0 = default (256)
+    early_stop_patience: int = 2,     # consecutive eval checkpoints at/above threshold
+                                      # before stopping early; 0 disables early stopping
+    early_stop_threshold: float = 1.0,
 ) -> dict:
     import os
     import glob
@@ -250,6 +264,8 @@ def train_low_level_ppo(
 
             history = []
             eval_history = []
+            consecutive_at_threshold = 0
+            stopped_early_at = None
             for i in range(start_iteration, n_iterations):
                 metrics = trainer.train_iteration(env_kwargs, i)
                 history.append(metrics)
@@ -272,17 +288,33 @@ def train_low_level_ppo(
                     print(f"  [eval @ iter {i+1}] {subgoal}: completion_rate={completion_rate:.1%} "
                           f"over {eval_episodes} fixed-seed episodes")
 
+                    if early_stop_patience > 0:
+                        if completion_rate >= early_stop_threshold:
+                            consecutive_at_threshold += 1
+                        else:
+                            consecutive_at_threshold = 0
+                        if consecutive_at_threshold >= early_stop_patience:
+                            stopped_early_at = i + 1
+                            streak_start = stopped_early_at - checkpoint_every * (consecutive_at_threshold - 1)
+                            print(f"  [early-stop] {subgoal}: completion_rate>={early_stop_threshold:.0%} "
+                                  f"held for {consecutive_at_threshold} consecutive eval checkpoints "
+                                  f"(since iter {streak_start}) — stopping at iter {stopped_early_at}, "
+                                  f"skipping remaining {n_iterations - stopped_early_at} iterations.")
+                            break
+
+            final_iteration = stopped_early_at if stopped_early_at is not None else n_iterations
+
             ckpt_out = os.path.join(MODEL_CACHE_DIR, "checkpoints", f"low_level_{subgoal}_ppo.pt")
             trainer.save_checkpoint(ckpt_out)
             model_volume.commit()
             print(f"  Saved -> {ckpt_out}")
 
-            if n_iterations % checkpoint_every == 0 and eval_history and eval_history[-1]["iteration"] == n_iterations:
+            if final_iteration % checkpoint_every == 0 and eval_history and eval_history[-1]["iteration"] == final_iteration:
                 completion_rate = eval_history[-1]["completion_rate"]
             else:
                 completion_rate = run_eval()
                 maybe_save_best(completion_rate)
-                eval_history.append({"iteration": n_iterations, "completion_rate": round(completion_rate, 4)})
+                eval_history.append({"iteration": final_iteration, "completion_rate": round(completion_rate, 4)})
 
             print(f"  [eval] {subgoal}: completion_rate={completion_rate:.1%} over {eval_episodes} episodes")
             print(f"  best  : completion_rate={best_completion_rate:.1%} -> {best_ckpt_path}")
@@ -295,6 +327,7 @@ def train_low_level_ppo(
                 "eval_history"        : eval_history,
                 "final_policy_loss"   : history[-1]["policy_loss"] if history else None,
                 "final_reward"        : history[-1]["mean_reward"] if history else None,
+                "stopped_early_at"    : stopped_early_at,
             }
         finally:
             # Tears down this subgoal's persistent worker pool before the
@@ -328,6 +361,8 @@ def main(
     clip_eps: float = 0.0,
     n_epochs: int = 0,
     minibatch_size: int = 0,
+    early_stop_patience: int = 2,
+    early_stop_threshold: float = 1.0,
 ):
     print(f"\nDispatching PPO+GAE low-level controller training to Modal (CPU)...")
     print(f"  subgoals={subgoals}  n_iterations={n_iterations}  resume={resume}  "
@@ -336,11 +371,13 @@ def main(
           f"gamma={gamma or 'default'}  gae_lambda={'default' if gae_lambda < 0 else gae_lambda}  "
           f"lr={lr or 'default'}  entropy_coef={'default' if entropy_coef < 0 else entropy_coef}  "
           f"clip_eps={clip_eps or 'default'}  n_epochs={n_epochs or 'default'}  "
-          f"minibatch_size={minibatch_size or 'default'}\n")
+          f"minibatch_size={minibatch_size or 'default'}  "
+          f"early_stop_patience={early_stop_patience}  early_stop_threshold={early_stop_threshold:.0%}\n")
     handle = train_low_level_ppo.spawn(
         subgoals=subgoals, n_iterations=n_iterations, resume=resume, resume_ckpt_iter=resume_ckpt_iter,
         n_rollouts=n_rollouts, n_workers=n_workers, gamma=gamma, gae_lambda=gae_lambda,
         lr=lr, entropy_coef=entropy_coef, clip_eps=clip_eps, n_epochs=n_epochs, minibatch_size=minibatch_size,
+        early_stop_patience=early_stop_patience, early_stop_threshold=early_stop_threshold,
     )
     print(f"Job spawned. Function call ID: {handle.object_id}")
     print(f"Monitor at https://modal.com")
