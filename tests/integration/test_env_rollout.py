@@ -14,7 +14,7 @@ import numpy as np
 
 import gymnasium_robotics  # noqa: F401  — registers Fetch* envs
 
-from think_then_act.env.setup import init_random_episode, setup_env
+from think_then_act.env.setup import get_contact_geoms, has_contact, init_random_episode, setup_env
 from think_then_act.env.wrapper import ObservationHarness
 from think_then_act.reward.dense_reward import compute_dense_reward
 
@@ -60,6 +60,32 @@ def test_init_random_episode_places_block_and_target_on_table():
         assert np.linalg.norm(desired_xy - TABLE_CENTRE) <= TABLE_RADIUS + 1e-6
         # init_random_episode retries until block/target are >0.10m apart.
         assert np.linalg.norm(achieved_xy - desired_xy) > 0.05
+    finally:
+        env.close()
+
+
+def test_contact_helpers_report_consistent_state():
+    env = _make_env(max_steps=5)
+    try:
+        env.reset(seed=3)
+        rng = np.random.default_rng(3)
+        init_random_episode(env, rng)
+
+        for _ in range(5):
+            pairs = get_contact_geoms(env)
+            assert isinstance(pairs, list)
+            assert all(isinstance(p, tuple) and len(p) == 2 for p in pairs)
+            assert all(isinstance(n, str) for p in pairs for n in p)
+
+            # has_contact() with no filter must agree with the raw pair count.
+            assert has_contact(env) == (len(pairs) > 0)
+
+            # A substring that can't match anything must always report False.
+            assert has_contact(env, "no_such_geom_xyz") is False
+
+            obs, _, terminated, truncated, _ = env.step(env.action_space.sample())
+            if terminated or truncated:
+                break
     finally:
         env.close()
 
