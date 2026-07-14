@@ -20,7 +20,7 @@ Outputs (on the volume, under /model-cache/episode_checks/):
     ep_seed{N}_{lora}.json   — per-step think/action/raw_response + state
 
 Download with:
-    modal volume get rl-harness-model-cache episode_checks/ ./episode_checks/
+    modal volume get rl-harness-model-cache episode_checks/ ./artifacts/episode_checks/
 """
 
 import modal
@@ -155,4 +155,4 @@ def main(seed: int = 0, lora: str = "none", max_steps: int = 45):
     print(f"\nDone. n_steps={result['n_steps']}  final_success={result['final_success']}")
     print(f"\nDownload with:")
     print(f"  python3 -m modal volume get --force rl-harness-model-cache "
-          f"episode_checks/ ./episode_checks/")
+          f"episode_checks/ ./artifacts/episode_checks/")
