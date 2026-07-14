@@ -13,7 +13,7 @@ Hierarchical architecture (working on the low-level controller; high-level VLM n
 
 The low-level MLP was first trained with GRPO, but it kept collapsing partway through training. PPO worked instead, because our reward is dense (feedback every step, not just at the end) — PPO's per-step critic uses that fully, and its update-clipping stops one bad batch from wrecking the policy, which is what we think was breaking GRPO.
 
-<img width="683" height="389" alt="image" src="https://github.com/user-attachments/assets/5102fe5c-ab35-4b86-86fc-1335ec60abe4" />
+<img width="341" height="180" alt="image" src="https://github.com/user-attachments/assets/5102fe5c-ab35-4b86-86fc-1335ec60abe4" />
 
 
 Rollouts also run faster now: with 8 CPUs, we run 8 MuJoCo episodes at once to collect data, then pause them while 1 core does the quick PPO update step, then repeat.
