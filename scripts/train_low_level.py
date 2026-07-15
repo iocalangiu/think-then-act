@@ -173,9 +173,13 @@ def train_low_level(
         return 0
 
     def make_env(subgoal: str):
+        # +250, not *2: init_episode_before_subgoal's oracle pre-subgoal
+        # setup (close_gripper/lift/move_to_target/release) needs headroom
+        # on top of the actual episode — see rollout_workers.py's
+        # _worker_init for the full rationale.
         base = ObservationHarness(
             gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
-                      max_episode_steps=max_episode_steps * 2)
+                      max_episode_steps=max_episode_steps + 250)
         )
         setup_env(base)
         return SubgoalConditionedEnv(

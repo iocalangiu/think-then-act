@@ -64,7 +64,7 @@ def record_subgoal_video(
                             # bypassing ckpt_iter/latest-iter entirely. Matters because
                             # training can regress after peaking (observed with GRPO).
 ) -> dict:
-    import os, glob, re
+    import os, re
     import numpy as np
     import torch
 
@@ -79,6 +79,7 @@ def record_subgoal_video(
     from think_then_act.perception.collision_predictor import CollisionPredictor
     from think_then_act.policy.subgoal_policy import SubgoalGaussianPolicy
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
+    from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
     from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
 
@@ -100,33 +101,15 @@ def record_subgoal_video(
 
     # ------------------------------------------------------------------
     # Resolve the "after" checkpoint: best (if requested), else explicit
-    # iter, else final, else highest available iter checkpoint.
+    # iter, else final, else highest available iter checkpoint (the last
+    # three via the shared helper — see training/checkpoints.py).
     # ------------------------------------------------------------------
-    if use_best:
-        after_ckpt = os.path.join(ckpt_dir, f"low_level_{subgoal}{suffix}_best.pt")
-        if not os.path.exists(after_ckpt):
-            raise FileNotFoundError(f"No best checkpoint at {after_ckpt}")
-    elif ckpt_iter > 0:
+    if ckpt_iter > 0 and not use_best:
         after_ckpt = os.path.join(ckpt_dir, f"low_level_{subgoal}{suffix}_iter{ckpt_iter}.pt")
         if not os.path.exists(after_ckpt):
             raise FileNotFoundError(f"No checkpoint at {after_ckpt}")
     else:
-        final_ckpt = os.path.join(ckpt_dir, f"low_level_{subgoal}{suffix}.pt")
-        if os.path.exists(final_ckpt):
-            after_ckpt = final_ckpt
-        else:
-            candidates = glob.glob(os.path.join(ckpt_dir, f"low_level_{subgoal}{suffix}_iter*.pt"))
-            if not candidates:
-                available = sorted(os.listdir(ckpt_dir)) if os.path.isdir(ckpt_dir) else []
-                raise FileNotFoundError(
-                    f"No checkpoint found for subgoal={subgoal!r} algo={algo!r} in {ckpt_dir}. "
-                    f"train_low_level{'_ppo' if algo == 'ppo' else ''}.py checkpoints every "
-                    f"`checkpoint_every` iterations (default 50) — wait for at least one to "
-                    f"land. Currently in {ckpt_dir}: {available}"
-                )
-            def iter_num(p):
-                return int(re.search(r"_iter(\d+)\.pt$", p).group(1))
-            after_ckpt = max(candidates, key=iter_num)
+        after_ckpt = resolve_subgoal_checkpoint(ckpt_dir, subgoal, algo=algo, use_best=use_best)
 
     print(f"  after checkpoint  -> {after_ckpt}")
 
@@ -142,9 +125,13 @@ def record_subgoal_video(
         collision_model.eval()
 
     def make_env():
+        # +250, not *2: init_episode_before_subgoal's oracle pre-subgoal
+        # setup (close_gripper/lift/move_to_target/release) needs headroom
+        # on top of the actual episode — see rollout_workers.py's
+        # _worker_init for the full rationale.
         base = ObservationHarness(
             gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
-                      max_episode_steps=max_steps * 2)
+                      max_episode_steps=max_steps + 250)
         )
         setup_env(base)
         wrapped = SubgoalConditionedEnv(
