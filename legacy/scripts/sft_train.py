@@ -26,12 +26,19 @@ from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DI
     timeout=3600 * 4,
 )
 def run_sft_training(
-    n_epochs         : int   = 2,
+    n_epochs         : int   = 8,     # upper bound only — early stopping ends the run sooner
     lr               : float = 2e-5,
     grad_accum_steps : int   = 8,
     lora_rank        : int   = 8,
-    max_examples     : int   = 0,   # 0 = use all
-    eval_every       : int   = 100, # print generated think text every N steps (0 = off)
+    max_examples     : int   = 0,     # 0 = use all
+    eval_every       : int   = 100,   # print generated think text every N steps (0 = off)
+    label_smoothing  : float = 0.1,   # applied to the TRAIN loss only; val loss stays raw CE
+                                       # so it's comparable to past runs' loss numbers
+    val_frac         : float = 0.1,   # fraction of EPISODES (not examples) held out
+    patience         : int   = 2,     # stop if val loss hasn't improved for this many epochs
+    min_delta        : float = 0.005, # minimum val-loss improvement to reset patience
+    load_in_4bit     : bool  = False, # QLoRA base — off by default; enable once the fp16
+                                       # run with the changes above is validated
 ) -> dict:
     import os, json, random, base64, io
     import numpy as np
@@ -64,19 +71,41 @@ def run_sft_training(
     if max_examples > 0:
         examples = examples[:max_examples]
 
-    random.shuffle(examples)
-
     phase_counts: dict = {}
     for ex in examples:
         phase_counts[ex["phase"]] = phase_counts.get(ex["phase"], 0) + 1
     print(f"  {len(examples)} examples  phases: {phase_counts}")
 
+    # Split by EPISODE, not example — adjacent steps within an episode are highly
+    # correlated (same trajectory), so an example-level split would leak train
+    # information into val and make early stopping's signal untrustworthy.
+    # Falls back to an all-train / no-val split for data generated before the
+    # "episode" field existed (see generate_sft_data.py).
+    episode_ids = sorted({ex["episode"] for ex in examples if "episode" in ex})
+    if episode_ids and val_frac > 0:
+        rng = random.Random(0)
+        rng.shuffle(episode_ids)
+        n_val_eps = max(1, int(len(episode_ids) * val_frac))
+        val_ep_ids = set(episode_ids[:n_val_eps])
+        train_examples = [ex for ex in examples if ex["episode"] not in val_ep_ids]
+        val_examples   = [ex for ex in examples if ex["episode"] in val_ep_ids]
+    else:
+        print("  [warn] no 'episode' field in data — skipping val split, no early stopping")
+        train_examples, val_examples = examples, []
+
+    print(f"  train={len(train_examples)} examples ({len(episode_ids) - len(val_ep_ids) if episode_ids and val_frac > 0 else '?'} episodes)"
+          f"  val={len(val_examples)} examples ({len(val_ep_ids) if episode_ids and val_frac > 0 else 0} episodes)")
+
+    examples = train_examples   # rest of the function trains on this name
+
     # ------------------------------------------------------------------
     # 2. Load model + LoRA
     # ------------------------------------------------------------------
-    print(f"\n[2/4] Loading model + LoRA (rank={lora_rank})...")
+    print(f"\n[2/4] Loading model + LoRA (rank={lora_rank}, 4bit={load_in_4bit})...")
 
-    base_model, processor = load_base_model(MODEL_ID, cache_dir=MODEL_CACHE_DIR)
+    base_model, processor = load_base_model(
+        MODEL_ID, cache_dir=MODEL_CACHE_DIR, load_in_4bit=load_in_4bit
+    )
 
     model = attach_lora(base_model, lora_rank=lora_rank)
     model.print_trainable_parameters()
@@ -89,7 +118,7 @@ def run_sft_training(
     # ------------------------------------------------------------------
     # 3. Loss function for one example
     # ------------------------------------------------------------------
-    def compute_loss(ex: dict) -> torch.Tensor:
+    def compute_loss(ex: dict, smoothing: float = 0.0) -> torch.Tensor:
         # Decode stored frame
         pil_image = Image.open(
             io.BytesIO(base64.b64decode(ex["frame_b64"]))
@@ -148,7 +177,21 @@ def run_sft_training(
         return F.cross_entropy(
             resp_logits.squeeze(0),
             resp_token_ids.squeeze(0),
+            label_smoothing=smoothing,
         )
+
+    def compute_val_loss() -> float:
+        """Mean raw (unsmoothed) CE loss over the held-out episodes."""
+        if not val_examples:
+            return float("nan")
+        model.eval()
+        total = 0.0
+        with torch.no_grad():
+            for ex in val_examples:
+                torch.cuda.empty_cache()
+                total += compute_loss(ex, smoothing=0.0).item()
+        model.train()
+        return total / len(val_examples)
 
     # ------------------------------------------------------------------
     # 3b. Quick eval helper — generates think text for one fixed example
@@ -207,8 +250,12 @@ def run_sft_training(
     print(f"\n[3/4] Training: {n_epochs} epochs  lr={lr}  grad_accum={grad_accum_steps}...")
     print(f"  {total_steps} total steps  estimated {est_min:.0f}–{est_min*2:.0f} min on A10G")
 
-    loss_history = []
-    global_step  = 0
+    loss_history     = []
+    val_loss_history = []
+    global_step      = 0
+    best_val_loss    = float("inf")
+    epochs_no_improve = 0
+    stopped_early    = False
 
     if eval_every > 0:
         quick_eval("before training")
@@ -221,7 +268,7 @@ def run_sft_training(
         for i, ex in enumerate(examples):
             torch.cuda.empty_cache()
 
-            loss = compute_loss(ex) / grad_accum_steps
+            loss = compute_loss(ex, smoothing=label_smoothing) / grad_accum_steps
             loss.backward()
             epoch_loss += loss.item() * grad_accum_steps
 
@@ -251,29 +298,57 @@ def run_sft_training(
 
         avg_epoch_loss = epoch_loss / len(examples)
         loss_history.append(round(avg_epoch_loss, 4))
-        print(f"  === Epoch {epoch+1} complete  avg_loss={avg_epoch_loss:.4f} ===\n")
+        val_loss = compute_val_loss()
+        val_loss_history.append(round(val_loss, 4))
+        print(f"  === Epoch {epoch+1} complete  train_loss={avg_epoch_loss:.4f}  "
+              f"val_loss={val_loss:.4f} ===\n")
         if eval_every > 0:
             quick_eval(f"end of epoch {epoch+1}")
 
-        # Save epoch checkpoint and update the canonical warmstart pointer
+        # Always keep a per-epoch checkpoint (cheap, useful for post-hoc comparison).
         epoch_ckpt = os.path.join(MODEL_CACHE_DIR, "checkpoints", f"sft_epoch_{epoch+1}")
         os.makedirs(epoch_ckpt, exist_ok=True)
         model.save_pretrained(epoch_ckpt)
-        # Also keep sft_warmstart pointing at the latest epoch for GRPO convenience
-        ckpt_path  = os.path.join(MODEL_CACHE_DIR, "checkpoints", "sft_warmstart")
-        os.makedirs(ckpt_path, exist_ok=True)
-        model.save_pretrained(ckpt_path)
-        model_volume.commit()
-        print(f"  Checkpoint saved → {epoch_ckpt}  (and → {ckpt_path})")
+
+        # sft_warmstart (the canonical GRPO-consuming pointer) now only advances on
+        # a real val-loss improvement, instead of always tracking the latest epoch —
+        # this was the exact gap behind sft_warmstart pointing at an overfit epoch 2
+        # checkpoint in the last run (epoch 1 loss ~0.85 was actually better).
+        val_signal = val_loss if val_examples else avg_epoch_loss
+        improved   = val_signal < best_val_loss - min_delta
+        if improved:
+            best_val_loss     = val_signal
+            epochs_no_improve = 0
+            ckpt_path = os.path.join(MODEL_CACHE_DIR, "checkpoints", "sft_warmstart")
+            os.makedirs(ckpt_path, exist_ok=True)
+            model.save_pretrained(ckpt_path)
+            model_volume.commit()
+            print(f"  [best] val_loss improved → sft_warmstart updated ← {epoch_ckpt}")
+        else:
+            epochs_no_improve += 1
+            model_volume.commit()
+            print(f"  Checkpoint saved → {epoch_ckpt}  "
+                  f"(val_loss did not improve, {epochs_no_improve}/{patience})")
+
+        if val_examples and epochs_no_improve >= patience:
+            print(f"  [early stop] no val_loss improvement for {patience} epochs — stopping.")
+            stopped_early = True
+            break
 
     # ------------------------------------------------------------------
     # 5. Final summary
     # ------------------------------------------------------------------
-    print(f"  Loss trend: {loss_history}")
+    print(f"  Train loss trend: {loss_history}")
+    print(f"  Val loss trend  : {val_loss_history}")
+    if stopped_early:
+        print(f"  Stopped early — best val_loss={best_val_loss:.4f}")
     print("=" * 60)
 
     return {
         "status"     : "PASS",
+        "stopped_early"    : stopped_early,
+        "best_val_loss"    : round(best_val_loss, 4) if val_examples else None,
+        "val_loss_trend"   : val_loss_history,
         "n_examples" : len(examples),
         "n_epochs"   : n_epochs,
         "loss_trend" : loss_history,
@@ -287,16 +362,24 @@ def run_sft_training(
 
 @app.local_entrypoint()
 def main(
-    n_epochs         : int   = 2,
+    n_epochs         : int   = 8,
     lr               : float = 2e-5,
     grad_accum_steps : int   = 8,
     eval_every       : int   = 100,
+    label_smoothing  : float = 0.1,
+    val_frac         : float = 0.1,
+    patience         : int   = 2,
+    load_in_4bit     : bool  = False,
 ):
     print(f"\nDispatching SFT training to Modal (A10G)...")
-    print(f"  epochs={n_epochs}  lr={lr}  grad_accum={grad_accum_steps}  eval_every={eval_every}\n")
+    print(f"  epochs<={n_epochs}  lr={lr}  grad_accum={grad_accum_steps}  eval_every={eval_every}")
+    print(f"  label_smoothing={label_smoothing}  val_frac={val_frac}  patience={patience}  "
+          f"4bit={load_in_4bit}\n")
 
     handle = run_sft_training.spawn(
-        n_epochs=n_epochs, lr=lr, grad_accum_steps=grad_accum_steps, eval_every=eval_every
+        n_epochs=n_epochs, lr=lr, grad_accum_steps=grad_accum_steps, eval_every=eval_every,
+        label_smoothing=label_smoothing, val_frac=val_frac, patience=patience,
+        load_in_4bit=load_in_4bit,
     )
     print(f"Job spawned. Function call ID: {handle.object_id}")
     print(f"Monitor at https://modal.com")

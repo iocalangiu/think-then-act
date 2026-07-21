@@ -23,7 +23,7 @@ Checkpoints land at:
     /model-cache/checkpoints/grpo_m6c_final       (end of run)
 
 Download final checkpoint:
-    modal volume get rl-harness-model-cache checkpoints/grpo_m6c_final ./grpo_m6c_final
+    modal volume get rl-harness-model-cache checkpoints/grpo_m6c_final ./checkpoints/grpo_m6c_final
 
 Run full eval against it:
     modal run scripts/eval.py --checkpoint-path /model-cache/checkpoints/grpo_m6c_final
@@ -48,6 +48,8 @@ def run_training(
     wandb_project: str = "",
     resume_from_iter: int = 0,
     sft_warmstart: bool = False,
+    load_in_4bit: bool = True,
+    entropy_coef: float = 0.01,
 ) -> dict:
     import os, time, json
     import numpy as np
@@ -119,6 +121,8 @@ def run_training(
         reward_noise_std=0.0,  # SFT model generates diverse actions; no artificial noise needed
         lr=5e-6,               # 10× lower than default — SFT warmstart needs gentle updates
         max_grad_norm=0.5,     # tighter clip to prevent format-breaking gradient spikes
+        load_in_4bit=load_in_4bit,
+        entropy_coef=entropy_coef,
     )
     trainer = GRPOTrainer(config)
 
@@ -133,16 +137,24 @@ def run_training(
 
     # ------------------------------------------------------------------
     # Environments
+    #
+    # train_envs: one independent env per group member — collect_rollouts
+    # steps them in lockstep and batches their prompts into a single
+    # generate() call per step_num (see grpo_trainer.py).
     # ------------------------------------------------------------------
-    train_env = ObservationHarness(
-        gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
-                 max_episode_steps=MAX_EPISODE_STEPS)
-    )
+    train_envs = [
+        ObservationHarness(
+            gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
+                     max_episode_steps=MAX_EPISODE_STEPS)
+        )
+        for _ in range(config.group_size)
+    ]
     eval_env = ObservationHarness(
         gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
                  max_episode_steps=MAX_EPISODE_STEPS)
     )
-    setup_env(train_env)
+    for e in train_envs:
+        setup_env(e)
     setup_env(eval_env)
 
     # ------------------------------------------------------------------
@@ -285,14 +297,17 @@ def run_training(
     for i in range(resume_from_iter, n_iterations):
         print(f"--- Iteration {i + 1} / {n_iterations} ---")
         t0      = time.time()
-        metrics = trainer.train_iteration(train_env, i)
+        metrics = trainer.train_iteration(train_envs, i)
         elapsed = time.time() - t0
         metrics["elapsed_s"] = round(elapsed, 1)
         history.append(metrics)
 
         parse_rate = metrics.get("parse_rate", float("nan"))
         avg_within_std = metrics.get("avg_within_std", float("nan"))
+        mean_entropy = metrics.get("mean_entropy", float("nan"))
         print(f"  loss={metrics['loss']:.4f}  "
+              f"policy_loss={metrics.get('policy_loss', float('nan')):.4f}  "
+              f"entropy={mean_entropy:.4f}  "
               f"mean_reward={metrics['mean_reward']:.4f}  "
               f"std={metrics['std_reward']:.4f}  "
               f"avg_within_std={avg_within_std:.4f}  "
@@ -305,6 +320,8 @@ def run_training(
         if wandb_enabled:
             wandb.log({
                 "train/loss"          : metrics["loss"],
+                "train/policy_loss"   : metrics.get("policy_loss"),
+                "train/mean_entropy"  : mean_entropy,
                 "train/mean_reward"   : metrics["mean_reward"],
                 "train/std_reward"    : metrics["std_reward"],
                 "train/avg_within_std": avg_within_std,
@@ -414,6 +431,8 @@ def main(
     wandb_project: str = "",
     resume_from_iter: int = 0,
     sft_warmstart: bool = False,
+    load_in_4bit: bool = True,
+    entropy_coef: float = 0.01,
 ):
     if resume_from_iter > 0:
         print(f"\nResuming M6C from iter {resume_from_iter} → {n_iterations}...")
@@ -421,6 +440,8 @@ def main(
         print(f"\nDispatching M6C to Modal (A10G, {n_iterations} iterations)...")
     if wandb_project:
         print(f"W&B project: {wandb_project}")
+    print(f"4-bit quantized base: {load_in_4bit}")
+    print(f"Entropy coef (beta): {entropy_coef}")
     print("Spawning job — terminal will return immediately. Monitor at https://modal.com\n")
 
     handle = run_training.spawn(
@@ -431,10 +452,12 @@ def main(
         wandb_project    = wandb_project,
         resume_from_iter = resume_from_iter,
         sft_warmstart    = sft_warmstart,
+        load_in_4bit     = load_in_4bit,
+        entropy_coef     = entropy_coef,
     )
 
     print(f"Job spawned. Function call ID: {handle.object_id}")
     print(f"\nCheckpoint will be saved to:")
     print(f"  /model-cache/checkpoints/grpo_m6c_final")
     print(f"\nDownload after training completes:")
-    print(f"  modal volume get rl-harness-model-cache checkpoints/grpo_m6c_final ./grpo_m6c_final")
+    print(f"  modal volume get rl-harness-model-cache checkpoints/grpo_m6c_final ./checkpoints/grpo_m6c_final")

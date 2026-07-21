@@ -25,71 +25,8 @@ Run with:
 import modal
 from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DIR
 from think_then_act.env.setup import setup_env, init_random_episode
+from think_then_act.env.oracle import oracle_action
 from think_then_act.policy.vlm_policy import encode_action, decode_action, N_BINS
-
-
-# ---------------------------------------------------------------------------
-# Oracle helpers
-# ---------------------------------------------------------------------------
-
-def oracle_action(obs_arr, achieved_goal, desired_goal, carrying: bool = False):
-    """
-    Scripted heuristic for FetchPickAndPlace. Returns (action, phase, carrying).
-
-    `carrying` is stateful hysteresis: once the block is grasped and lifted, stay
-    in CARRY until the block clearly escapes the gripper (d_3d > 0.12).  Without
-    this, CARRY moves toward the target (which is at table height), descending the
-    block below the block_z > 0.45 threshold and causing GRASP/CARRY oscillation.
-    """
-    import numpy as np
-
-    rel          = obs_arr[6:9]              # object_rel_pos = block - gripper
-    finger_width = float(np.sum(obs_arr[9:11]))
-
-    d_3d = float(np.linalg.norm(rel))
-    d_xy = float(np.linalg.norm(rel[:2]))
-
-    block_z = float(achieved_goal[2])
-    grip_z  = block_z - float(rel[2])
-
-    block_lifted  = block_z > 0.45
-    # Once carrying, only exit if block escapes (wider tolerance than initial grasp).
-    is_grasped    = (block_lifted and d_3d < 0.10) or (carrying and d_3d < 0.12)
-    at_block_zone = grip_z <= block_z + 0.10
-
-    if is_grasped:
-        phase     = "CARRY"
-        carrying  = True
-        direction = np.array(desired_goal) - np.array(achieved_goal)
-        grip      = -1.0                              # CLOSE — keep block grasped
-    elif d_3d < 0.10 or at_block_zone:
-        phase    = "GRASP"
-        carrying = False
-        if grip_z > block_z + 0.025:
-            direction = np.array(rel)                 # move toward block (XY+Z)
-            grip      = 1.0                           # OPEN during descent
-        elif finger_width > 0.07:
-            direction = np.zeros(3)                   # stay still, close fingers
-            grip      = -1.0                          # CLOSE
-        else:
-            direction = np.array([0.0, 0.0, 1.0])    # lift
-            grip      = -1.0                          # CLOSE — maintain grasp
-    elif d_xy > 0.1:
-        phase     = "APPROACH"
-        carrying  = False
-        direction = np.array([rel[0], rel[1], 0.0])   # lateral only
-        grip      = 1.0                               # OPEN
-    else:
-        phase     = "APPROACH"
-        carrying  = False
-        direction = np.array([rel[0], rel[1], rel[2]])  # full 3D descent
-        grip      = 1.0                               # OPEN
-
-    norm  = float(np.linalg.norm(direction)) + 1e-8
-    scale = min(1.0, float(np.linalg.norm(direction)) / 0.05)
-    dx, dy, dz = (direction / norm) * scale
-
-    return np.clip([dx, dy, dz, grip], -1.0, 1.0).astype(np.float32), phase, carrying
 
 
 def make_think_text(obs_arr, achieved_goal, desired_goal, action, phase):
@@ -227,6 +164,8 @@ def run_episode(env, seed: int, max_steps: int,
                   f"fw={fw:.3f}m  bins={action_bins}")
 
         examples.append({
+            "episode"      : seed,   # groups steps from the same episode — used for a
+                                     # leakage-free train/val split in sft_train.py
             "frame"        : frame,
             "gripper_pos"  : obs_arr[0:3].tolist(),
             "achieved_goal": achieved_goal.tolist(),
@@ -361,7 +300,7 @@ def main(n_episodes: int = 50, debug: bool = False):
         result = generate_sft_data.remote(n_episodes=1, max_steps=50, verbose_every=1)
         print(f"\nDone.  Phases: {result['phase_counts']}")
         print("Download with:")
-        print("  modal volume get rl-harness-model-cache sft_sample.mp4 ./sft_sample.mp4")
+        print("  modal volume get rl-harness-model-cache sft_sample.mp4 ./artifacts/sft_sample.mp4")
         return
 
     print(f"\nGenerating SFT data: {n_episodes} episodes × 50 steps (no GPU)...")
@@ -372,5 +311,5 @@ def main(n_episodes: int = 50, debug: bool = False):
     print(f"  Skipped  : {result['skip_count']}")
     print(f"  Output   : {result['output_path']}")
     print(f"\nDownload with:")
-    print(f"  modal volume get rl-harness-model-cache sft_data.jsonl ./sft_data.jsonl")
-    print(f"  modal volume get rl-harness-model-cache sft_sample.mp4 ./sft_sample.mp4")
+    print(f"  modal volume get rl-harness-model-cache sft_data.jsonl ./artifacts/sft_data.jsonl")
+    print(f"  modal volume get rl-harness-model-cache sft_sample.mp4 ./artifacts/sft_sample.mp4")

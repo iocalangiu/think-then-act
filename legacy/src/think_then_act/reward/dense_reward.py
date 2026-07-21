@@ -13,7 +13,7 @@ information at every step, decomposed into four components:
 
   R1 (approach)  : -d(gripper, block)           — always active
   R2 (transport) : -2 * d(block, target)         — always active, higher weight
-  R3 (grasp)     : +0.5 * closedness             — active when gripper near block
+  R3 (grasp)     : +0.5 * closedness * proximity — continuous, grows as gripper nears block
   R4 (success)   : +10.0                         — large one-time bonus on success
 
 Observation vector layout for FetchPickAndPlace (25 floats):
@@ -44,21 +44,21 @@ class RewardWeights:
     These are reasonable starting values; you may need to adjust them
     during RL training (Milestone 5) if one component dominates too early.
     """
-    w_approach   : float = 1.0    # multiplier for gripper→block distance penalty
-    w_transport  : float = 2.0    # multiplier for block→target distance penalty
-    w_grasp      : float = 0.5    # bonus for closed gripper when near block
-    w_success    : float = 10.0   # large reward for task completion
-    grasp_radius : float = 0.05   # metres: gripper must be within this to get grasp bonus
-    finger_open  : float = 0.10   # sum of both finger widths when fully open
+    w_approach    : float = 1.0    # multiplier for gripper→block distance penalty
+    w_transport   : float = 2.0    # multiplier for block→target distance penalty
+    w_grasp       : float = 0.5    # bonus for closed gripper, scaled by proximity
+    w_success     : float = 10.0   # large reward for task completion
+    grasp_falloff : float = 0.15   # metres: e-fold distance for the grasp proximity term
+    finger_open   : float = 0.10   # sum of both finger widths when fully open
 
     def as_dict(self) -> dict:
         return {
-            "w_approach"  : self.w_approach,
-            "w_transport" : self.w_transport,
-            "w_grasp"     : self.w_grasp,
-            "w_success"   : self.w_success,
-            "grasp_radius": self.grasp_radius,
-            "finger_open" : self.finger_open,
+            "w_approach"   : self.w_approach,
+            "w_transport"  : self.w_transport,
+            "w_grasp"      : self.w_grasp,
+            "w_success"    : self.w_success,
+            "grasp_falloff": self.grasp_falloff,
+            "finger_open"  : self.finger_open,
         }
 
 
@@ -126,14 +126,21 @@ def compute_dense_reward(
 
     # ------------------------------------------------------------------
     # R3: Grasp bonus
-    # Incentivises closing the gripper once it's physically near the block.
+    # Incentivises closing the gripper as it nears the block.
     # gripper_closedness: 0 = fully open, 1 = fully closed.
-    # We only award this bonus when the gripper is within grasp_radius.
+    #
+    # This used to gate on a hard radius (d_grip_block <= 0.05m): telemetry
+    # showed the policy plateaus around d_grip_block~0.4m (the oracle's own
+    # GRASP-phase entry threshold is d_3d<0.10 — looser than 0.05 by 2x, and
+    # still never reached), so that gate made r_grasp exactly zero for entire
+    # episodes — no gradient ever reached the grip dimension. Continuous
+    # exponential falloff instead gives a nonzero, monotonically increasing
+    # incentive to keep closing the gap and the gripper, everywhere.
     # ------------------------------------------------------------------
     total_finger_width  = float(np.sum(gripper_state))
     gripper_closedness  = 1.0 - np.clip(total_finger_width / weights.finger_open, 0.0, 1.0)
-    is_near_block       = d_grip_block <= weights.grasp_radius
-    r_grasp             = weights.w_grasp * float(is_near_block) * gripper_closedness
+    grasp_proximity     = float(np.exp(-d_grip_block / weights.grasp_falloff))
+    r_grasp             = weights.w_grasp * grasp_proximity * gripper_closedness
 
     # ------------------------------------------------------------------
     # R4: Success bonus
@@ -158,7 +165,7 @@ def compute_dense_reward(
         "d_grip_block"     : round(d_grip_block,       5),
         "d_block_target"   : round(d_block_target,     5),
         "gripper_closedness": round(gripper_closedness, 5),
-        "is_near_block"    : is_near_block,
+        "grasp_proximity"  : round(grasp_proximity,    5),
         "is_success"       : is_success,
     }
 

@@ -16,7 +16,7 @@ What this does:
 
 Use this before and after training to compare base vs trained policy.
 Download the rollout video with:
-    modal volume get rl-harness-model-cache eval_rollout.mp4 ./eval_rollout.mp4
+    modal volume get rl-harness-model-cache eval_rollout.mp4 ./artifacts/eval_rollout.mp4
 """
 
 import modal
@@ -211,7 +211,7 @@ def run_evaluation(
     save_video(video_frames, video_path, fps=10)
     model_volume.commit()
     print(f"  Saved → {video_path}")
-    print(f"  Download: modal volume get rl-harness-model-cache eval_rollout.mp4 ./eval_rollout.mp4")
+    print(f"  Download: modal volume get rl-harness-model-cache eval_rollout.mp4 ./artifacts/eval_rollout.mp4")
 
     # ------------------------------------------------------------------
     # Aggregate metrics
@@ -281,5 +281,5 @@ def main(checkpoint_path: str = ""):
     print(f"Mean return  : {result['mean_return']:.4f}")
     print(f"Parse rate   : {result['action_parse_rate']:.1%}")
     print(f"\nDownload video:")
-    print(f"  modal volume get rl-harness-model-cache eval_rollout.mp4 ./eval_rollout.mp4")
+    print(f"  modal volume get rl-harness-model-cache eval_rollout.mp4 ./artifacts/eval_rollout.mp4")
     print(f"\nMilestone 6B complete.")

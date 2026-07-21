@@ -67,12 +67,14 @@ def run_grpo_training(n_iterations: int = 5) -> dict:
     # Create environment
     # ------------------------------------------------------------------
     print("\nCreating FetchPickAndPlace-v3 with ObservationHarness...")
-    env = gym.make(
-        "FetchPickAndPlace-v3",
-        render_mode="rgb_array",
-        max_episode_steps=5,          # short rollouts — 1 action per rollout
-    )
-    env = ObservationHarness(env)
+    envs = [
+        ObservationHarness(gym.make(
+            "FetchPickAndPlace-v3",
+            render_mode="rgb_array",
+            max_episode_steps=5,          # short rollouts — 1 action per rollout
+        ))
+        for _ in range(config.group_size)
+    ]
 
     # ------------------------------------------------------------------
     # Training loop
@@ -83,7 +85,7 @@ def run_grpo_training(n_iterations: int = 5) -> dict:
     for i in range(n_iterations):
         print(f"--- Iteration {i + 1} / {n_iterations} ---")
         t0 = time.time()
-        metrics = trainer.train_iteration(env, i)
+        metrics = trainer.train_iteration(envs, i)
         elapsed = time.time() - t0
         metrics["elapsed_s"] = round(elapsed, 1)
         history.append(metrics)
@@ -93,7 +95,8 @@ def run_grpo_training(n_iterations: int = 5) -> dict:
               f"std_reward={metrics['std_reward']:.4f}  "
               f"elapsed={elapsed:.1f}s\n")
 
-    env.close()
+    for env in envs:
+        env.close()
 
     # ------------------------------------------------------------------
     # Save LoRA checkpoint to persistent Modal Volume
