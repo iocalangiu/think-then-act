@@ -81,6 +81,7 @@ def record_subgoal_video(
 
     from think_then_act.env.setup import setup_env, save_video
     from think_then_act.env.wrapper import ObservationHarness
+    from think_then_act.perception.block_pose_predictor import BlockPosePredictor
     from think_then_act.perception.collision_predictor import CollisionPredictor
     from think_then_act.policy.subgoal_policy import SubgoalGaussianPolicy
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
@@ -129,6 +130,16 @@ def record_subgoal_video(
         collision_model.load_state_dict(torch.load(collision_ckpt, map_location="cpu"))
         collision_model.eval()
 
+    # Optional block pose predictor — same as train_low_level_ppo.py, so the
+    # observation matches what training actually saw. Reward/done in
+    # SubgoalConditionedEnv always stay on ground truth regardless.
+    pose_model = None
+    pose_ckpt = os.path.join(ckpt_dir, "block_pose_predictor.pt")
+    if os.path.exists(pose_ckpt):
+        pose_model = BlockPosePredictor()
+        pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
+        pose_model.eval()
+
     def make_env():
         # +250, not *2: init_episode_before_subgoal's oracle pre-subgoal
         # setup (close_gripper/lift/move_to_target/release) needs headroom
@@ -141,7 +152,7 @@ def record_subgoal_video(
         setup_env(base)
         wrapped = SubgoalConditionedEnv(
             base, subgoal=subgoal, collision_model=collision_model,
-            max_episode_steps=max_steps,
+            pose_model=pose_model, max_episode_steps=max_steps,
         )
         return base, wrapped
 

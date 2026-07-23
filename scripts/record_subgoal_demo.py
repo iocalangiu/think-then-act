@@ -231,6 +231,7 @@ def record_subgoal_demo(
 
     from think_then_act.env.setup import setup_env, save_video
     from think_then_act.env.wrapper import ObservationHarness
+    from think_then_act.perception.block_pose_predictor import BlockPosePredictor
     from think_then_act.perception.collision_predictor import CollisionPredictor
     from think_then_act.policy.subgoal_vlm_policy import SubgoalVLMPolicy
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
@@ -253,6 +254,18 @@ def record_subgoal_demo(
         collision_model.eval()
         print(f"  collision model   <- {collision_ckpt}")
 
+    # Optional block pose predictor — same as train_low_level_ppo.py; every
+    # skill's build_obs uses its estimate instead of the privileged
+    # achieved_goal when present (reward/done inside each skill's execution
+    # loop stay on ground truth regardless — see block_pose_predictor.py).
+    pose_model = None
+    pose_ckpt = os.path.join(ckpt_dir, "block_pose_predictor.pt")
+    if os.path.exists(pose_ckpt):
+        pose_model = BlockPosePredictor()
+        pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
+        pose_model.eval()
+        print(f"  pose model        <- {pose_ckpt}")
+
     # Only the subgoals with a trained low-level policy so far (per
     # hierarchical_architecture memory, 2026-07-16) — lift/move_to_target/
     # release have no skill to execute yet, so the rollout stops if the VLM
@@ -264,7 +277,7 @@ def record_subgoal_demo(
         policies[subgoal] = _load_actor(ckpt, obs_dim=SUBGOAL_OBS_DIM)
         print(f"  {subgoal:14s}    <- {ckpt}")
 
-    skills = build_fetch_skills(policies, collision_model, max_steps=max_steps_per_skill)
+    skills = build_fetch_skills(policies, collision_model, pose_model, max_steps=max_steps_per_skill)
 
     print(f"\n  Loading high-level VLM (checkpoints/subgoal_sft_warmstart)...")
     vlm_policy = SubgoalVLMPolicy(

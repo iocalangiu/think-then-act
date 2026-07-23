@@ -43,6 +43,16 @@ class _CountingCollisionModel:
         return self.prob
 
 
+class _CountingPoseModel:
+    def __init__(self, pos=(9.0, 9.0, 9.0)):
+        self.pos = np.array(pos, dtype=np.float32)
+        self.n_calls = 0
+
+    def predict_position(self, frame):
+        self.n_calls += 1
+        return self.pos
+
+
 def test_build_fetch_skills_rejects_unknown_subgoal():
     with pytest.raises(ValueError):
         build_fetch_skills({"not_a_subgoal": _FakePolicy()})
@@ -102,6 +112,73 @@ def test_collision_prob_feeds_into_descend_reward():
         collision_prob=0.8,
     )
     assert reward == pytest.approx(expected_reward)
+
+
+def test_build_obs_uses_ground_truth_achieved_goal_when_no_pose_model():
+    skills = build_fetch_skills({"align_xy": _FakePolicy()}, max_steps=30)
+    obs = _make_obs()
+    base_env = _FakeBaseEnv(frame=np.zeros((4, 4, 3), dtype=np.uint8))
+
+    got = skills["align_xy"].build_obs(obs, base_env)
+    expected = build_subgoal_observation(
+        obs["observation"], obs["achieved_goal"], obs["desired_goal"],
+        "align_xy", 0.0,
+    )
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_build_obs_uses_pose_model_estimate_when_set():
+    pose_model = _CountingPoseModel(pos=(9.0, 9.0, 9.0))
+    skills = build_fetch_skills({"align_xy": _FakePolicy()}, pose_model=pose_model, max_steps=30)
+    obs = _make_obs()
+    base_env = _FakeBaseEnv(frame=np.zeros((4, 4, 3), dtype=np.uint8))
+
+    got = skills["align_xy"].build_obs(obs, base_env)
+    expected = build_subgoal_observation(
+        obs["observation"], pose_model.pos, obs["desired_goal"],
+        "align_xy", 0.0,
+    )
+    np.testing.assert_array_equal(got, expected)
+    # Deliberately NOT equal to the ground-truth-achieved_goal version —
+    # confirms the pose model's (very different) estimate actually made it
+    # into the observation, not silently ignored.
+    ground_truth_obs = build_subgoal_observation(
+        obs["observation"], obs["achieved_goal"], obs["desired_goal"],
+        "align_xy", 0.0,
+    )
+    assert not np.array_equal(got, ground_truth_obs)
+
+
+def test_reward_and_done_stays_on_ground_truth_regardless_of_pose_model():
+    """The whole point of keeping reward/done privileged: a pose model
+    reporting a wildly wrong position must not change success semantics."""
+    pose_model = _CountingPoseModel(pos=(9.0, 9.0, 9.0))
+    skills = build_fetch_skills({"move_to_target": _FakePolicy()}, pose_model=pose_model)
+    obs = _make_obs()
+    base_env = _FakeBaseEnv(frame=np.zeros((4, 4, 3), dtype=np.uint8))
+
+    reward, done = skills["move_to_target"].reward_and_done(obs, base_env)
+    expected_reward, expected_breakdown = compute_subgoal_reward(
+        "move_to_target", obs["observation"], obs["achieved_goal"], obs["desired_goal"],
+    )
+    assert reward == pytest.approx(expected_reward)
+    assert done == expected_breakdown["done"]
+
+
+def test_pose_estimate_memoized_per_frame_not_per_call():
+    pose_model = _CountingPoseModel()
+    skills = build_fetch_skills({"align_xy": _FakePolicy()}, pose_model=pose_model)
+    obs = _make_obs()
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    base_env = _FakeBaseEnv(frame=frame)
+
+    skills["align_xy"].build_obs(obs, base_env)
+    skills["align_xy"].build_obs(obs, base_env)
+    assert pose_model.n_calls == 1   # same frame -> memoized, not recomputed
+
+    base_env._frame = np.ones((4, 4, 3), dtype=np.uint8)   # new frame
+    skills["align_xy"].build_obs(obs, base_env)
+    assert pose_model.n_calls == 2   # new frame -> recomputed once
 
 
 def test_build_fetch_skills_returns_one_skill_per_policy_with_correct_max_steps():
