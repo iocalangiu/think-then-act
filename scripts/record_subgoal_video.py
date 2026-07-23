@@ -36,6 +36,11 @@ Run with:
 Outputs (on the volume, under /model-cache/subgoal_videos/):
     {subgoal}_before.mp4   — random-init policy
     {subgoal}_after_iter{N}.mp4 — trained checkpoint
+    {subgoal}_after_iter{N}_trajectory.json — per-step block_pos/grip_pos/
+        d_grip_block/action for the AFTER rollout only, so you can see
+        exactly which step the block starts moving and whether it
+        correlates with the action's dx/dy/dz (also printed to stdout,
+        with a "<- block moved" marker on steps where block_pos changed).
 
 Download with:
     modal volume get rl-harness-model-cache subgoal_videos/ ./artifacts/subgoal_videos/
@@ -64,7 +69,7 @@ def record_subgoal_video(
                             # bypassing ckpt_iter/latest-iter entirely. Matters because
                             # training can regress after peaking (observed with GRPO).
 ) -> dict:
-    import os, re
+    import os, re, json
     import numpy as np
     import torch
 
@@ -147,19 +152,34 @@ def record_subgoal_video(
         frames = [base.last_frame()]
         total_reward = 0.0
         success = False
+        # Per-step block/gripper trajectory — lets a caller pinpoint exactly
+        # WHEN the block starts moving and correlate it with the action
+        # taken that step, rather than just eyeballing the video (added
+        # 2026-07-16 while diagnosing close_gripper's block-drift-on-contact
+        # issue; info["block_pos"]/["grip_pos"] come from subgoal_env.py).
+        trajectory = [{
+            "step": 0, "action": None,
+            "block_pos": info.get("block_pos"), "grip_pos": info.get("grip_pos"),
+            "d_grip_block": info.get("d_grip_block"),
+        }]
 
-        for _ in range(max_steps):
+        for step in range(1, max_steps + 1):
             action = policy.act(obs, deterministic=not stochastic)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             frames.append(base.last_frame())
+            trajectory.append({
+                "step": step, "action": np.asarray(action).tolist(),
+                "block_pos": info.get("block_pos"), "grip_pos": info.get("grip_pos"),
+                "d_grip_block": info.get("d_grip_block"),
+            })
             if info.get("done", False):
                 success = True
             if terminated or truncated:
                 break
 
         env.close()
-        return frames, total_reward, success
+        return frames, total_reward, success, trajectory
 
     out_dir = os.path.join(MODEL_CACHE_DIR, "subgoal_videos")
     os.makedirs(out_dir, exist_ok=True)
@@ -171,12 +191,24 @@ def record_subgoal_video(
     print(f"\n[1/2] Recording BEFORE (random init)...")
     torch.manual_seed(seed)
     before_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
-    frames, total_reward, success = rollout(before_policy)
+    frames, total_reward, success, before_trajectory = rollout(before_policy)
     before_path = os.path.join(out_dir, f"{subgoal}_before.mp4")
     save_video(frames, before_path, fps=10)
+    before_traj_path = os.path.join(out_dir, f"{subgoal}_before_trajectory.json")
+    with open(before_traj_path, "w") as f:
+        json.dump(before_trajectory, f, indent=2)
     model_volume.commit()   # commit immediately — if the "after" step below throws
                              # (e.g. bad checkpoint), this video must not be lost too
     print(f"  {len(frames)} frames  total_reward={total_reward:.3f}  success={success}")
+    print(f"  Saved -> {before_traj_path}")
+    # step-0 comes straight from init_episode_before_subgoal's scripted-oracle
+    # setup, which runs BEFORE either policy (random-init or trained) takes a
+    # single action — so it should be numerically identical to the AFTER
+    # rollout's step-0 below (same seed). Printed explicitly so "does the
+    # gripper really start higher in one video?" can be checked against
+    # numbers instead of two videos with possibly different camera framing.
+    step0 = before_trajectory[0]
+    print(f"  step0 block_pos={step0['block_pos']}  grip_pos={step0['grip_pos']}")
     print(f"  Saved -> {before_path}")
     results["before"] = {"video_path": before_path, "total_reward": round(total_reward, 4),
                           "success": success, "n_frames": len(frames)}
@@ -192,7 +224,7 @@ def record_subgoal_video(
     # rollout. GRPO checkpoints are a flat state_dict, loaded as-is.
     after_policy.load_state_dict(ckpt["actor"] if isinstance(ckpt, dict) and "actor" in ckpt else ckpt)
     after_policy.eval()
-    frames, total_reward, success = rollout(after_policy)
+    frames, total_reward, success, trajectory = rollout(after_policy)
     iter_match = re.search(r"_iter(\d+)\.pt$", after_ckpt)
     if iter_match:
         tag = iter_match.group(1)
@@ -202,15 +234,60 @@ def record_subgoal_video(
         tag = "final"
     after_path = os.path.join(out_dir, f"{subgoal}{suffix}_after_{tag}.mp4")
     save_video(frames, after_path, fps=10)
+
+    # Per-step block/gripper trajectory for the trained rollout — pinpoints
+    # exactly which step the block starts moving (as opposed to eyeballing
+    # the video), and whether it correlates with a nonzero dx/dy/dz action
+    # (wrist translating) or happens even while the action's translation
+    # is ~0 (fingers-closing-on-off-center-block instead). Saved as JSON
+    # next to the video; also printed so it's visible straight in the logs.
+    traj_path = os.path.join(out_dir, f"{subgoal}{suffix}_after_{tag}_trajectory.json")
+    with open(traj_path, "w") as f:
+        json.dump(trajectory, f, indent=2)
     model_volume.commit()
+
     print(f"  {len(frames)} frames  total_reward={total_reward:.3f}  success={success}")
     print(f"  Saved -> {after_path}")
+    print(f"  Saved -> {traj_path}")
+    print(f"\n  {'step':>4} {'block_pos':>28} {'grip_pos':>28} {'d_grip_block':>13} {'action':>28}")
+    prev_block_pos = None
+    for row in trajectory:
+        block_pos = row["block_pos"]
+        moved = (
+            prev_block_pos is not None and block_pos is not None
+            and float(np.linalg.norm(np.array(block_pos) - np.array(prev_block_pos))) > 1e-4
+        )
+        marker = "  <- block moved" if moved else ""
+        block_str = "[" + ", ".join(f"{v:.4f}" for v in block_pos) + "]" if block_pos else "None"
+        grip_str  = "[" + ", ".join(f"{v:.4f}" for v in row["grip_pos"]) + "]" if row["grip_pos"] else "None"
+        action_str = ("[" + ", ".join(f"{v:.3f}" for v in row["action"]) + "]") if row["action"] else "None"
+        d_gb = row["d_grip_block"]
+        d_gb_str = f"{d_gb:.4f}" if d_gb is not None else "n/a"
+        print(f"  {row['step']:>4} {block_str:>28} {grip_str:>28} {d_gb_str:>13} {action_str:>28}{marker}")
+        if block_pos is not None:
+            prev_block_pos = block_pos
+
     results["after"] = {"video_path": after_path, "total_reward": round(total_reward, 4),
-                         "success": success, "n_frames": len(frames), "ckpt": after_ckpt}
+                         "success": success, "n_frames": len(frames), "ckpt": after_ckpt,
+                         "trajectory_path": traj_path}
 
     print("\n" + "=" * 60)
     print(f"  before: total_reward={results['before']['total_reward']}  success={results['before']['success']}")
     print(f"  after : total_reward={results['after']['total_reward']}  success={results['after']['success']}")
+    # Direct numeric check for "does the AFTER rollout genuinely start in a
+    # different position than BEFORE?" — both use the same seed and the
+    # same scripted-oracle setup (init_episode_before_subgoal), which runs
+    # before either policy acts, so step0 should be identical. A nonzero
+    # diff here would mean something ELSE differs between the two calls
+    # (not policy behavior), worth its own investigation.
+    before_step0, after_step0 = before_trajectory[0], trajectory[0]
+    grip_diff = float(np.linalg.norm(
+        np.array(before_step0["grip_pos"]) - np.array(after_step0["grip_pos"])
+    ))
+    print(f"  step0 grip_pos  before={before_step0['grip_pos']}")
+    print(f"                  after ={after_step0['grip_pos']}")
+    print(f"                  diff  ={grip_diff:.6f}  "
+          f"({'IDENTICAL as expected' if grip_diff < 1e-6 else 'DIFFERENT -- investigate'})")
     print("=" * 60)
 
     return {"status": "PASS", "subgoal": subgoal, "results": results}
