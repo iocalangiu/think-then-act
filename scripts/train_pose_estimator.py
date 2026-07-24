@@ -88,6 +88,22 @@ def train_pose_estimator(
     x_train, y_train = to_tensors(train_examples)
     x_val,   y_val   = to_tensors(val_examples) if val_examples else (None, None)
 
+    # Naive "always predict the train-set mean position, ignore the image
+    # entirely" baseline — computed once, up front, and compared against the
+    # trained model's val error below. A regressor that collapses to
+    # near-constant output (a real risk under plain MSE, which treats
+    # predicting the mean as a strong local minimum) would show val error
+    # barely beating this number, which pure aggregate metrics alone
+    # wouldn't reveal — same "don't trust a single number, ground it"
+    # discipline as validate_pose_predictor.py's per-stage breakdown.
+    train_mean_pos = y_train.mean(dim=0)
+    if y_val is not None:
+        baseline_error_cm = float((y_val - train_mean_pos).norm(dim=1).mean().item() * 100.0)
+        print(f"  Baseline (predict train-mean position {train_mean_pos.tolist()}, "
+              f"ignore image): val_mean_euclidean_error_cm={baseline_error_cm:.2f}")
+    else:
+        baseline_error_cm = float("nan")
+
     # ------------------------------------------------------------------
     # 2. Model + optimizer
     # ------------------------------------------------------------------
@@ -166,6 +182,11 @@ def train_pose_estimator(
     print(f"\n[3/3] Done. Train loss trend: {loss_history}")
     print(f"  Val loss trend               : {val_loss_history}")
     print(f"  Val mean euclidean error (cm): {val_err_cm_history}")
+    print(f"  Baseline (predict mean, cm)  : {baseline_error_cm:.2f}")
+    best_err_cm = min(val_err_cm_history) if val_err_cm_history else float("nan")
+    beats_baseline = best_err_cm < baseline_error_cm - 0.5   # 0.5cm margin, not noise
+    print(f"  Best model beats baseline by : {baseline_error_cm - best_err_cm:.2f}cm "
+          f"({'YES — learning real signal from pixels' if beats_baseline else 'NO — model is not meaningfully better than ignoring the image'})")
     print(f"  Checkpoint -> {ckpt_path}")
     print("=" * 60)
 
@@ -176,6 +197,8 @@ def train_pose_estimator(
         "loss_trend"      : loss_history,
         "val_loss_trend"  : val_loss_history,
         "val_err_cm_trend": val_err_cm_history,
+        "baseline_error_cm": round(baseline_error_cm, 3),
+        "beats_baseline"   : beats_baseline,
         "ckpt_path"       : ckpt_path,
     }
 
@@ -189,4 +212,6 @@ def main(n_epochs: int = 20, lr: float = 1e-3, batch_size: int = 32):
     if result["val_err_cm_trend"]:
         best_idx = result["val_loss_trend"].index(result["best_val_loss"])
         print(f"At best checkpoint: val_mean_euclidean_error_cm={result['val_err_cm_trend'][best_idx]}")
+    print(f"Baseline (predict mean, ignore image): {result['baseline_error_cm']}cm  "
+          f"beats_baseline={result['beats_baseline']}")
     print(f"Checkpoint: {result['ckpt_path']}")

@@ -21,6 +21,27 @@ this project (see memory: hierarchical_architecture.md, close_gripper) have
 already been gamed by proxy signals multiple times; keeping done/reward on
 ground truth keeps completion_rate trustworthy while this model's own
 accuracy stays independently measurable (see scripts/validate_pose_predictor.py).
+
+Deliberately does NOT end its conv backbone with a global average pool the
+way collision_predictor.py does, despite the otherwise-identical backbone
+shape. Global average pooling is the right inductive bias for THAT model's
+task (translation-invariant "is any contact happening anywhere" — a global
+yes/no), but it is the wrong one here: it destroys the very spatial
+location information a position estimate depends on. Confirmed empirically
+(2026-07-23), not assumed: a first version of this model using
+AdaptiveAvgPool2d(1) never beat a "predict the training-set mean position,
+ignore the image entirely" baseline (val error 14.87cm vs. baseline
+14.99cm) after training loss plateaued immediately post-epoch-1 — the
+classic signature of MSE collapsing to a near-constant output. Root-caused
+via per-pixel Pearson correlation between raw pixel intensity and true
+block x/y across the collected dataset: real signal exists (max |r|~0.6,
+survives the 64x64 downsample) but is concentrated in a small, spatially
+localized patch (~55 of 4096 pixels at 64x64) — global-average-pooling the
+8x8 post-conv feature map into one value per channel dilutes that small
+patch in with the other ~60 mostly-irrelevant cells (dominated by the
+randomized arm pose, not the block) before the regression head ever sees
+it. Flattening the full spatial feature map instead preserves that
+localized signal for the head to actually use.
 """
 
 from __future__ import annotations
@@ -31,6 +52,7 @@ import torch.nn as nn
 
 FRAME_SIZE = 64  # same cost-budget rationale as collision_predictor.py —
                   # this also runs every low-level step
+_FEATURE_MAP_SIZE = FRAME_SIZE // 8   # 3 stride-2 convs: 64 -> 32 -> 16 -> 8
 
 
 class BlockPosePredictor(nn.Module):
@@ -40,12 +62,13 @@ class BlockPosePredictor(nn.Module):
             nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
+            # NO AdaptiveAvgPool2d(1) here — see module docstring for why
+            # that's wrong for position regression specifically.
         )
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64, 32), nn.ReLU(inplace=True),
-            nn.Linear(32, 3),
+            nn.Linear(64 * _FEATURE_MAP_SIZE * _FEATURE_MAP_SIZE, 128), nn.ReLU(inplace=True),
+            nn.Linear(128, 3),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

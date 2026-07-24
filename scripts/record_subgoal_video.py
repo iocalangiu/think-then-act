@@ -68,6 +68,11 @@ def record_subgoal_video(
                             # highest-completion_rate checkpoint tracked during training),
                             # bypassing ckpt_iter/latest-iter entirely. Matters because
                             # training can regress after peaking (observed with GRPO).
+    use_pose_model: bool = True,  # False: force ground-truth achieved_goal even if a
+                            # block_pose_predictor.pt checkpoint exists — lets the SAME
+                            # trained low-level checkpoint be A/B'd with vs. without
+                            # perception noise in its observation, on the same seed,
+                            # rather than needing to move the checkpoint file to test this.
 ) -> dict:
     import os, re, json
     import numpy as np
@@ -104,6 +109,11 @@ def record_subgoal_video(
                                                 # with GRPO's on the same volume.
 
     ckpt_dir = os.path.join(MODEL_CACHE_DIR, "checkpoints")
+    # Distinguishes a with-perception run's outputs from a without-perception
+    # (--use-pose-model=False, or no checkpoint yet) run's outputs on the
+    # same subgoal/seed, so an A/B comparison doesn't silently overwrite one
+    # video with the other.
+    pose_tag = "_perceived" if (use_pose_model and os.path.exists(os.path.join(ckpt_dir, "block_pose_predictor.pt"))) else ""
 
     # ------------------------------------------------------------------
     # Resolve the "after" checkpoint: best (if requested), else explicit
@@ -135,10 +145,31 @@ def record_subgoal_video(
     # SubgoalConditionedEnv always stay on ground truth regardless.
     pose_model = None
     pose_ckpt = os.path.join(ckpt_dir, "block_pose_predictor.pt")
-    if os.path.exists(pose_ckpt):
+    if use_pose_model and os.path.exists(pose_ckpt):
         pose_model = BlockPosePredictor()
         pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
         pose_model.eval()
+        print(f"  pose model        <- {pose_ckpt}")
+    elif not use_pose_model:
+        print(f"  pose model disabled (--use-pose-model=False) — using ground-truth achieved_goal")
+
+    # Only relevant for subgoal="descend" — starts each episode from
+    # wherever a trained align_xy actually leaves the arm instead of a
+    # fresh scattered reset, matching train_low_level_ppo.py (see
+    # env/setup.py's _run_align_xy_until_done, 2026-07-24). Without this,
+    # reviewing descend in isolation would use a DIFFERENT starting
+    # distribution than what it was actually trained/deployed against.
+    align_xy_policy = None
+    align_xy_ckpt = os.path.join(ckpt_dir, "low_level_align_xy_ppo_best.pt")
+    if subgoal == "descend" and os.path.exists(align_xy_ckpt):
+        align_xy_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+        align_xy_ckpt_data = torch.load(align_xy_ckpt, map_location="cpu")
+        align_xy_policy.load_state_dict(
+            align_xy_ckpt_data["actor"] if isinstance(align_xy_ckpt_data, dict) and "actor" in align_xy_ckpt_data
+            else align_xy_ckpt_data
+        )
+        align_xy_policy.eval()
+        print(f"  align_xy policy   <- {align_xy_ckpt}  (descend's episode setup)")
 
     def make_env():
         # +250, not *2: init_episode_before_subgoal's oracle pre-subgoal
@@ -152,7 +183,7 @@ def record_subgoal_video(
         setup_env(base)
         wrapped = SubgoalConditionedEnv(
             base, subgoal=subgoal, collision_model=collision_model,
-            pose_model=pose_model, max_episode_steps=max_steps,
+            pose_model=pose_model, align_xy_policy=align_xy_policy, max_episode_steps=max_steps,
         )
         return base, wrapped
 
@@ -168,9 +199,15 @@ def record_subgoal_video(
         # taken that step, rather than just eyeballing the video (added
         # 2026-07-16 while diagnosing close_gripper's block-drift-on-contact
         # issue; info["block_pos"]/["grip_pos"] come from subgoal_env.py).
+        # perceived_block_pos (added alongside block_pos when pose_model is
+        # set — see subgoal_env.py) is what the POLICY's observation
+        # actually contained; block_pos stays ground truth. Comparing the
+        # two per step directly shows the pose model's real-trajectory
+        # error, not just its offline validation-set number.
         trajectory = [{
             "step": 0, "action": None,
             "block_pos": info.get("block_pos"), "grip_pos": info.get("grip_pos"),
+            "perceived_block_pos": info.get("perceived_block_pos"),
             "d_grip_block": info.get("d_grip_block"),
         }]
 
@@ -182,6 +219,7 @@ def record_subgoal_video(
             trajectory.append({
                 "step": step, "action": np.asarray(action).tolist(),
                 "block_pos": info.get("block_pos"), "grip_pos": info.get("grip_pos"),
+                "perceived_block_pos": info.get("perceived_block_pos"),
                 "d_grip_block": info.get("d_grip_block"),
             })
             if info.get("done", False):
@@ -203,9 +241,9 @@ def record_subgoal_video(
     torch.manual_seed(seed)
     before_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
     frames, total_reward, success, before_trajectory = rollout(before_policy)
-    before_path = os.path.join(out_dir, f"{subgoal}_before.mp4")
+    before_path = os.path.join(out_dir, f"{subgoal}{pose_tag}_before.mp4")
     save_video(frames, before_path, fps=10)
-    before_traj_path = os.path.join(out_dir, f"{subgoal}_before_trajectory.json")
+    before_traj_path = os.path.join(out_dir, f"{subgoal}{pose_tag}_before_trajectory.json")
     with open(before_traj_path, "w") as f:
         json.dump(before_trajectory, f, indent=2)
     model_volume.commit()   # commit immediately — if the "after" step below throws
@@ -243,7 +281,7 @@ def record_subgoal_video(
         tag = "best"
     else:
         tag = "final"
-    after_path = os.path.join(out_dir, f"{subgoal}{suffix}_after_{tag}.mp4")
+    after_path = os.path.join(out_dir, f"{subgoal}{suffix}{pose_tag}_after_{tag}.mp4")
     save_video(frames, after_path, fps=10)
 
     # Per-step block/gripper trajectory for the trained rollout — pinpoints
@@ -252,7 +290,7 @@ def record_subgoal_video(
     # (wrist translating) or happens even while the action's translation
     # is ~0 (fingers-closing-on-off-center-block instead). Saved as JSON
     # next to the video; also printed so it's visible straight in the logs.
-    traj_path = os.path.join(out_dir, f"{subgoal}{suffix}_after_{tag}_trajectory.json")
+    traj_path = os.path.join(out_dir, f"{subgoal}{suffix}{pose_tag}_after_{tag}_trajectory.json")
     with open(traj_path, "w") as f:
         json.dump(trajectory, f, indent=2)
     model_volume.commit()
@@ -260,7 +298,22 @@ def record_subgoal_video(
     print(f"  {len(frames)} frames  total_reward={total_reward:.3f}  success={success}")
     print(f"  Saved -> {after_path}")
     print(f"  Saved -> {traj_path}")
-    print(f"\n  {'step':>4} {'block_pos':>28} {'grip_pos':>28} {'d_grip_block':>13} {'action':>28}")
+    if pose_model is not None:
+        # Mean per-step pose error along THIS actual trajectory — a direct,
+        # real-rollout number to sit next to validate_pose_predictor.py's
+        # offline held-out-set number, not a replacement for it (this is one
+        # trajectory, not a held-out sample).
+        pose_errs = [
+            float(np.linalg.norm(np.array(r["block_pos"]) - np.array(r["perceived_block_pos"])))
+            for r in trajectory if r["block_pos"] is not None and r["perceived_block_pos"] is not None
+        ]
+        if pose_errs:
+            print(f"  perceived vs. true block_pos: mean={np.mean(pose_errs)*100:.2f}cm  "
+                  f"max={np.max(pose_errs)*100:.2f}cm  (over {len(pose_errs)} steps this rollout)")
+    header = f"\n  {'step':>4} {'block_pos':>28} {'grip_pos':>28} {'d_grip_block':>13} {'action':>28}"
+    if pose_model is not None:
+        header += f" {'perceived_block_pos':>28}"
+    print(header)
     prev_block_pos = None
     for row in trajectory:
         block_pos = row["block_pos"]
@@ -274,7 +327,12 @@ def record_subgoal_video(
         action_str = ("[" + ", ".join(f"{v:.3f}" for v in row["action"]) + "]") if row["action"] else "None"
         d_gb = row["d_grip_block"]
         d_gb_str = f"{d_gb:.4f}" if d_gb is not None else "n/a"
-        print(f"  {row['step']:>4} {block_str:>28} {grip_str:>28} {d_gb_str:>13} {action_str:>28}{marker}")
+        line = f"  {row['step']:>4} {block_str:>28} {grip_str:>28} {d_gb_str:>13} {action_str:>28}"
+        if pose_model is not None:
+            perceived = row["perceived_block_pos"]
+            perceived_str = "[" + ", ".join(f"{v:.4f}" for v in perceived) + "]" if perceived else "None"
+            line += f" {perceived_str:>28}"
+        print(line + marker)
         if block_pos is not None:
             prev_block_pos = block_pos
 
@@ -308,13 +366,14 @@ def record_subgoal_video(
 def main(
     subgoal: str = "align_xy", seed: int = 0, max_steps: int = 30,
     ckpt_iter: int = 0, stochastic: bool = False,
-    algo: str = "grpo", use_best: bool = False,
+    algo: str = "grpo", use_best: bool = False, use_pose_model: bool = True,
 ):
     print(f"\nRecording before/after videos for subgoal={subgoal} algo={algo} "
-          f"use_best={use_best}...")
+          f"use_best={use_best} use_pose_model={use_pose_model}...")
     result = record_subgoal_video.remote(
         subgoal=subgoal, seed=seed, max_steps=max_steps,
         ckpt_iter=ckpt_iter, stochastic=stochastic, algo=algo, use_best=use_best,
+        use_pose_model=use_pose_model,
     )
     b, a = result["results"]["before"], result["results"]["after"]
     print(f"\nDone.")

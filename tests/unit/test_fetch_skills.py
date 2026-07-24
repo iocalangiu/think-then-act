@@ -9,7 +9,9 @@ import pytest
 
 from think_then_act.training.fetch_skills import build_fetch_skills
 from think_then_act.reward.subgoal_reward import compute_subgoal_reward
-from think_then_act.training.subgoal_features import build_subgoal_observation
+from think_then_act.training.subgoal_features import (
+    build_subgoal_observation, sanitize_observation_for_perception,
+)
 
 
 def _make_obs():
@@ -134,8 +136,13 @@ def test_build_obs_uses_pose_model_estimate_when_set():
     base_env = _FakeBaseEnv(frame=np.zeros((4, 4, 3), dtype=np.uint8))
 
     got = skills["align_xy"].build_obs(obs, base_env)
+    # obs["observation"] itself must ALSO be sanitized (indices 3:6/6:9 —
+    # see sanitize_observation_for_perception's docstring for the leak this
+    # closes), not just the achieved_goal argument, or the policy still
+    # reads the true block position straight out of object_rel_pos.
+    sanitized_observation = sanitize_observation_for_perception(obs["observation"], pose_model.pos)
     expected = build_subgoal_observation(
-        obs["observation"], pose_model.pos, obs["desired_goal"],
+        sanitized_observation, pose_model.pos, obs["desired_goal"],
         "align_xy", 0.0,
     )
     np.testing.assert_array_equal(got, expected)
@@ -147,6 +154,24 @@ def test_build_obs_uses_pose_model_estimate_when_set():
         "align_xy", 0.0,
     )
     assert not np.array_equal(got, ground_truth_obs)
+
+
+def test_build_obs_sanitizes_object_pos_and_object_rel_pos_not_just_achieved_goal():
+    """The specific regression this guards: object_pos/object_rel_pos
+    (obs[3:6], obs[6:9]) must not leak the TRUE block position through once
+    a pose model is active, even though build_subgoal_observation's
+    achieved_goal argument is correctly using the perceived estimate."""
+    pose_model = _CountingPoseModel(pos=(9.0, 9.0, 9.0))
+    skills = build_fetch_skills({"align_xy": _FakePolicy()}, pose_model=pose_model, max_steps=30)
+    obs = _make_obs()
+    base_env = _FakeBaseEnv(frame=np.zeros((4, 4, 3), dtype=np.uint8))
+
+    got = skills["align_xy"].build_obs(obs, base_env)
+    grip_pos = obs["observation"][0:3]
+    np.testing.assert_allclose(got[3:6], pose_model.pos)
+    np.testing.assert_allclose(got[6:9], pose_model.pos - grip_pos)
+    # The TRUE achieved_goal must NOT appear anywhere in those slices.
+    assert not np.allclose(got[3:6], obs["achieved_goal"])
 
 
 def test_reward_and_done_stays_on_ground_truth_regardless_of_pose_model():
