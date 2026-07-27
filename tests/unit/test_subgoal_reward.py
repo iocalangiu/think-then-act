@@ -70,6 +70,32 @@ def test_descend_penalizes_collision_probability():
     assert r_risky < r_safe
 
 
+def test_descend_done_requires_xy_alignment_not_just_height():
+    # Regression guard for the 2026-07-20 bug: a live demo rollout showed a
+    # trained policy reaching grasp height while having drifted ~0.5m
+    # laterally, and the OLD done condition (d_z alone) still fired. This
+    # reproduces that exact shape: height is satisfied but xy has drifted
+    # well past descend_dxy_limit.
+    block = [1.3, 0.75, 0.425]
+    drifted_obs = _make_obs([1.3 + 0.5, 0.75, 0.43])  # d_z fine, d_xy=0.5m
+
+    _, breakdown = reward_descend(drifted_obs, block, [0, 0, 0])
+
+    assert breakdown["d_z"] <= W.descend_threshold
+    assert breakdown["done"] is False
+
+
+def test_descend_penalizes_xy_drift():
+    block = [1.3, 0.75, 0.55]
+    aligned_obs = _make_obs([1.3, 0.75, 0.6])
+    drifted_obs = _make_obs([1.3 + 0.2, 0.75, 0.6])  # same d_z, worse d_xy
+
+    r_aligned, _ = reward_descend(aligned_obs, block, [0, 0, 0])
+    r_drifted, _ = reward_descend(drifted_obs, block, [0, 0, 0])
+
+    assert r_aligned > r_drifted
+
+
 # ---------------------------------------------------------------------------
 # close_gripper
 # ---------------------------------------------------------------------------

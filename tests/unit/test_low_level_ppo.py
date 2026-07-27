@@ -124,6 +124,43 @@ def test_ppo_step_averages_initial_and_final_d_grip_block_when_present():
     assert metrics["mean_final_d_grip_block"] == pytest.approx(0.04)
 
 
+def test_ppo_step_d_xy_d_z_metrics_are_none_when_not_tracked():
+    # close_gripper's rollouts don't surface d_xy/d_z — _make_rollout's
+    # synthetic rollouts don't have the keys either, matching that.
+    trainer = _make_trainer(n_epochs=1, minibatch_size=8)
+    obs = np.zeros(OBS_DIM, dtype=np.float32)
+    rollouts = [_make_rollout(trainer, obs, [(np.array([0.0, 0, 0, 0], dtype=np.float32), 0.0)])]
+
+    metrics = trainer.ppo_step(rollouts)
+    assert metrics["mean_initial_d_xy"] is None
+    assert metrics["mean_final_d_xy"] is None
+    assert metrics["mean_initial_d_z"] is None
+    assert metrics["mean_final_d_z"] is None
+
+
+def test_ppo_step_averages_initial_and_final_d_xy_d_z_when_present():
+    # Only align_xy/descend's rollouts (via rollout_workers.py) carry
+    # d_xy; only descend's carry d_z — simulate by attaching directly.
+    trainer = _make_trainer(n_epochs=1, minibatch_size=8)
+    obs = np.zeros(OBS_DIM, dtype=np.float32)
+    rollout_a = _make_rollout(trainer, obs, [(np.array([0.0, 0, 0, 0], dtype=np.float32), 0.0)])
+    rollout_a["initial_d_xy"] = 0.30
+    rollout_a["final_d_xy"]   = 0.02
+    rollout_a["initial_d_z"]  = 0.40
+    rollout_a["final_d_z"]    = 0.01
+    rollout_b = _make_rollout(trainer, obs, [(np.array([0.0, 0, 0, 0], dtype=np.float32), 0.0)])
+    rollout_b["initial_d_xy"] = 0.20
+    rollout_b["final_d_xy"]   = 0.06
+    rollout_b["initial_d_z"]  = 0.30
+    rollout_b["final_d_z"]    = 0.03
+
+    metrics = trainer.ppo_step([rollout_a, rollout_b])
+    assert metrics["mean_initial_d_xy"] == pytest.approx(0.25)
+    assert metrics["mean_final_d_xy"] == pytest.approx(0.04)
+    assert metrics["mean_initial_d_z"] == pytest.approx(0.35)
+    assert metrics["mean_final_d_z"] == pytest.approx(0.02)
+
+
 def test_ppo_step_actually_changes_actor_and_critic_parameters():
     trainer = _make_trainer(n_epochs=2, minibatch_size=8)
     obs = np.zeros(OBS_DIM, dtype=np.float32)
