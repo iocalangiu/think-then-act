@@ -189,6 +189,34 @@ def make_subgoal_think_text(obs_arr, achieved_goal, desired_goal, subgoal: str, 
     lift_height_mm              = mm(W.lift_height)
     move_to_target_threshold_mm = mm(W.move_to_target_threshold)
 
+    # Grasp-ready check (close_gripper's OWN done gate: reward_close_gripper
+    # requires d_xy<=close_gripper_dxy_limit AND d_z<=close_gripper_dz_limit),
+    # computed for REAL here and required in ALL THREE approach-phase
+    # templates below — not just close_gripper's. Added 2026-07-21 after a
+    # live multi-seed demo showed the VLM invoking close_gripper from
+    # d_z=315-395mm (nowhere near actually positioned), 3/3 times stating
+    # "(<= 20mm tolerance)" when the true value was 15-20x over. Root cause:
+    # that clause was FIXED TEXT, only ever written when close_gripper was
+    # the true label (so it was always true in training data) — the model
+    # never saw a counterexample where the same check reads false, so it
+    # learned "close_gripper -> always say satisfied" as a string
+    # association, decoupled from the actual numbers. Requiring the SAME
+    # check, dynamically evaluated, in align_xy/descend's templates too
+    # means the model now sees it read "not ready" from those (the common
+    # case there) contrasted with "ready" from close_gripper's own examples
+    # — the same escape-hatch-closing pattern already used for
+    # dz/height_above_table on 2026-07-20.
+    close_gripper_xy_ready = d_xy <= W.close_gripper_dxy_limit
+    close_gripper_z_ready  = d_z  <= W.close_gripper_dz_limit
+    close_gripper_ready    = bool(close_gripper_xy_ready and close_gripper_z_ready)
+    grasp_ready_check = (
+        f"Grasp-ready check: dxy={mm(d_xy)}mm vs {close_gripper_dxy_limit_mm}mm tolerance "
+        f"({'within' if close_gripper_xy_ready else 'NOT within'}), "
+        f"dz={mm(d_z)}mm vs {close_gripper_dz_limit_mm}mm tolerance "
+        f"({'within' if close_gripper_z_ready else 'NOT within'}) "
+        f"-> {'ready to close the gripper' if close_gripper_ready else 'not ready to close the gripper yet'}. "
+    )
+
     reasons = {
         "align_xy": (
             f"dx = block_x - gripper_x = {block_pos[0]} - {grip_pos[0]} = {dx}m = {mm(dx)}mm. "
@@ -196,6 +224,7 @@ def make_subgoal_think_text(obs_arr, achieved_goal, desired_goal, subgoal: str, 
             f"xy_distance = sqrt(dx^2 + dy^2) = {d_xy}m = {mm(d_xy)}mm, which is greater than "
             f"the {align_xy_threshold_mm}mm alignment tolerance. "
             f"dz = gripper_z - block_z = {grip_pos[2]} - {block_pos[2]} = {d_z}m = {mm(d_z)}mm. "
+            f"{grasp_ready_check}"
             f"xy isn't aligned yet, so grasp height doesn't matter until that's fixed. "
             f"{ALIGN_XY_PHRASINGS[rng.integers(len(ALIGN_XY_PHRASINGS))]}"
         ),
@@ -206,16 +235,16 @@ def make_subgoal_think_text(obs_arr, achieved_goal, desired_goal, subgoal: str, 
             f"the {align_xy_threshold_mm}mm alignment tolerance. "
             f"dz = gripper_z - block_z = {grip_pos[2]} - {block_pos[2]} = {d_z}m = {mm(d_z)}mm, "
             f"which is greater than the {descend_threshold_mm}mm grasp-height tolerance. "
+            f"{grasp_ready_check}"
             f"I need to descend."
         ),
         "close_gripper": (
             f"dx = block_x - gripper_x = {block_pos[0]} - {grip_pos[0]} = {dx}m = {mm(dx)}mm. "
             f"dy = block_y - gripper_y = {block_pos[1]} - {grip_pos[1]} = {dy}m = {mm(dy)}mm. "
-            f"xy_distance = sqrt(dx^2 + dy^2) = {d_xy}m = {mm(d_xy)}mm "
-            f"(<= {close_gripper_dxy_limit_mm}mm tolerance). "
-            f"dz = gripper_z - block_z = {grip_pos[2]} - {block_pos[2]} = {d_z}m = {mm(d_z)}mm "
-            f"(<= {close_gripper_dz_limit_mm}mm tolerance) — positioned at the "
-            f"block, fingers still open ({fw}m). Time to close the gripper."
+            f"xy_distance = sqrt(dx^2 + dy^2) = {d_xy}m = {mm(d_xy)}mm. "
+            f"dz = gripper_z - block_z = {grip_pos[2]} - {block_pos[2]} = {d_z}m = {mm(d_z)}mm. "
+            f"{grasp_ready_check}"
+            f"Fingers still open ({fw}m). Time to close the gripper."
         ),
         "lift": (
             f"height_above_table = block_z - table_z = {block_pos[2]} - {W.table_z} = "
@@ -297,6 +326,119 @@ def make_example(obs, frame, subgoal: str, source: str, episode_id: int, rng) ->
         "think"        : think,
         "subgoal"      : subgoal,
     }
+
+
+def make_arithmetic_drill_examples(rng, n_examples: int, frame, episode_id_start: int) -> list:
+    """
+    Synthetic, vision-decoupled examples that drill the model's Euclidean-
+    combination arithmetic (dx,dy -> xy_distance) and threshold comparison
+    directly, instead of relying on it being learned incidentally from
+    embedded-in-context robot reasoning. Added 2026-07-21 after a live SFT
+    eval showed the model stating xy_distance=613mm for dx=121mm/dy=613mm
+    (the true hypotenuse is ~625mm) — it was pattern-completing "just take
+    the larger term," not actually combining them, even AFTER the
+    grasp_ready_check fix (see make_subgoal_think_text) made the
+    COMPARISON step correct given a right d_xy/d_z. That fix doesn't help
+    if the upstream number fed into it is wrong — this targets the
+    upstream arithmetic step directly, per the same theory the screenshot
+    reference gave (drill the bare operation, not just the embedded task).
+
+    No mujoco/env needed: label_subgoal, is_block_grasped, and
+    make_subgoal_think_text only ever read obs_arr[0:3] (gripper_pos) and
+    obs_arr[9:11] (finger widths) off the raw observation — achieved_goal/
+    desired_goal are separate arguments already, not derived from obs. A
+    synthetic obs_arr with everything else left at 0 is byte-identical, as
+    far as this whole path is concerned, to a real one.
+
+    `frame`: a SINGLE reused real frame (from wherever the caller already
+    has one from a live rollout) — its visual content is irrelevant here,
+    since the whole point is drilling TEXT-stated-number arithmetic, which
+    per this project's original "raw sensor states only, let CoT reason"
+    design was never supposed to require reading positions off the image
+    anyway.
+
+    Three buckets, each guaranteed BY CONSTRUCTION (via the SAME
+    label_subgoal used everywhere else — not a separately-invented rule)
+    to produce a specific true label, deliberately scoped to
+    align_xy/descend/close_gripper only (the confirmed failure region —
+    the three subgoals with trained low-level skills, per
+    hierarchical_architecture memory), with wide + boundary-concentrated
+    sampling:
+      - align_xy: d_xy > 20mm (wide range, some just over the boundary).
+        d_z varies FREELY across its own wide+boundary-concentrated range,
+        since align_xy's own done check ignores d_z entirely — this
+        bucket alone drills BOTH outcomes of grasp_ready_check, since d_z
+        can land on either side of its 20mm threshold independent of d_xy.
+      - descend: d_xy <= 20mm (tight, matching real label-consistency
+        requirements), d_z > 20mm, wide range — drills the dz magnitude ->
+        comparison mapping (grasp_ready_check always reads "not ready"
+        here, matching the true label, but the underlying magnitude still
+        varies widely).
+      - close_gripper: d_xy <= 20mm AND d_z <= 20mm, both varying within
+        that tight band — drills the "ready" case, and the boundary from
+        the inside.
+    """
+    import numpy as np
+    from think_then_act.reward.subgoal_reward import DEFAULT_WEIGHTS
+    from think_then_act.training.subgoal_labeler import label_subgoal
+
+    W = DEFAULT_WEIGHTS
+    table_cx, table_cy, r_max = 1.30, 0.75, 0.20
+
+    def sample_disk_xy():
+        r     = np.sqrt(rng.uniform(0.0, 1.0)) * r_max
+        theta = rng.uniform(0.0, 2 * np.pi)
+        return table_cx + r * np.cos(theta), table_cy + r * np.sin(theta)
+
+    def sample_magnitude(near_boundary: float, wide_hi: float) -> float:
+        # 50/50 mixture: uniform over the whole plausible range (general
+        # coverage), or concentrated (+/- 20mm) around a known decision
+        # threshold (sharpens the exact boundary the model keeps getting
+        # wrong) — the OTHER half of "more synthetic data" beyond just
+        # volume: density where it actually matters.
+        if rng.uniform() < 0.5:
+            return float(rng.uniform(0.0, wide_hi))
+        return float(abs(rng.normal(near_boundary, 0.02)))
+
+    buckets = ["align_xy", "descend", "close_gripper"]
+    examples = []
+    for i in range(n_examples):
+        bucket = buckets[i % len(buckets)]
+        bx, by = sample_disk_xy()
+        tx, ty = sample_disk_xy()
+        block_pos  = np.array([bx, by, W.table_z])
+        target_pos = np.array([tx, ty, W.table_z])
+
+        if bucket == "align_xy":
+            d_xy = W.align_xy_threshold + sample_magnitude(0.0, 0.8) + 1e-4
+            d_z  = max(sample_magnitude(W.close_gripper_dz_limit, 0.6) - 0.05, -0.02)
+        elif bucket == "descend":
+            d_xy = rng.uniform(0.0, W.align_xy_threshold * 0.95)
+            d_z  = W.close_gripper_dz_limit + sample_magnitude(0.0, 0.5) + 1e-4
+        else:  # close_gripper
+            d_xy = rng.uniform(0.0, W.align_xy_threshold * 0.95)
+            d_z  = rng.uniform(-0.01, W.close_gripper_dz_limit * 0.95)
+
+        theta = rng.uniform(0.0, 2 * np.pi)
+        gripper_pos = np.array([
+            block_pos[0] + d_xy * np.cos(theta),
+            block_pos[1] + d_xy * np.sin(theta),
+            block_pos[2] + d_z,
+        ])
+
+        obs_arr = np.zeros(25, dtype=np.float64)
+        obs_arr[0:3]  = gripper_pos
+        obs_arr[9:11] = [0.05, 0.05]  # fingers open -> is_grasped False regardless of distance
+
+        label = label_subgoal(obs_arr, block_pos, target_pos)
+        if label != bucket:
+            continue  # construction should guarantee this; skip a rare float-edge miss rather than mislabel
+
+        examples.append(make_example(
+            {"observation": obs_arr, "achieved_goal": block_pos, "desired_goal": target_pos},
+            frame, label, "drill", episode_id_start + i, rng,
+        ))
+    return examples
 
 
 def _run_skill(skill, base_env, obs) -> tuple:
@@ -502,7 +644,22 @@ def generate_subgoal_sft_data(
     # near-duplicate align_xy frames; more, shorter episodes (more distinct
     # resets) beat one long one for the same total step budget.
     max_random_steps: int = 15,
-    seeded_jitter_steps: int = 2,
+    # Bumped 2->5 (2026-07-21): run_seeded_subgoal re-labels fresh at EVERY
+    # jittered step (not fixed to the seed target), so a bigger jitter
+    # budget naturally yields more examples that drift just past a nearby
+    # threshold and get correctly relabeled — exactly the contrastive
+    # boundary data the new grasp_ready_check needs (close_gripper's own
+    # dxy/dz gate, now required in align_xy/descend's templates too) to
+    # actually teach the comparison instead of memorizing a fixed clause.
+    seeded_jitter_steps: int = 5,
+    # Vision-decoupled arithmetic drill examples (see
+    # make_arithmetic_drill_examples) — 900 total, split evenly across
+    # align_xy/descend/close_gripper, a modest addition against the
+    # ~3000+ examples from the sources above (not dominating the label
+    # balance) but enough to meaningfully densify coverage of the
+    # dx,dy->xy_distance combination across a wide, boundary-concentrated
+    # range. Set to 0 to disable.
+    n_drill_examples: int = 900,
     algo: str = "ppo",
     use_best: bool = False,
     verbose_every: int = 0,
@@ -573,7 +730,7 @@ def generate_subgoal_sft_data(
 
     all_examples  = []
     label_counts  = {label: 0 for label in SUBGOAL_LABELS}
-    source_counts = {"chained": 0, "seeded": 0, "random": 0}
+    source_counts = {"chained": 0, "seeded": 0, "random": 0, "drill": 0}
     skip_count    = 0
     episode_id    = 0
 
@@ -611,6 +768,18 @@ def generate_subgoal_sft_data(
         examples = run_random_policy_episode(base_env, rng, episode_id, max_random_steps)
         episode_id += 1
         _record(examples, "random")
+
+    if n_drill_examples > 0:
+        print(f"\n  Arithmetic drill examples ({n_drill_examples})...")
+        drill_rng = np.random.default_rng(4_000_000)
+        # Reuses whatever frame the env is currently showing -- content is
+        # irrelevant, see make_arithmetic_drill_examples's docstring.
+        drill_frame = base_env.last_frame()
+        examples = make_arithmetic_drill_examples(drill_rng, n_drill_examples, drill_frame, episode_id)
+        episode_id += n_drill_examples
+        _record(examples, "drill")
+        print(f"    generated={len(examples)}  (of {n_drill_examples} requested; "
+              f"a few can be skipped on a rare float-edge label mismatch)")
 
     base_env.close()
 
