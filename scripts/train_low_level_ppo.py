@@ -92,7 +92,9 @@ def train_low_level_ppo(
 
     from think_then_act.env.setup import setup_env
     from think_then_act.env.wrapper import ObservationHarness
+    from think_then_act.perception.block_pose_predictor import BlockPosePredictor
     from think_then_act.perception.collision_predictor import CollisionPredictor
+    from think_then_act.policy.subgoal_policy import SubgoalGaussianPolicy
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
     from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
@@ -122,6 +124,39 @@ def train_low_level_ppo(
         print(f"  No collision predictor checkpoint — "
               f"'descend' will train with collision_prob=0.0 for every step "
               f"(run train_collision_predictor.py first for the real signal).")
+
+    # ------------------------------------------------------------------
+    # Block pose predictor (optional — replaces the privileged achieved_goal
+    # fed into every subgoal's OBSERVATION with a learned estimate; reward/
+    # done stay on ground truth regardless — see block_pose_predictor.py's
+    # docstring). Same checkpoint-path-only threading through worker
+    # processes as collision_ckpt above.
+    # ------------------------------------------------------------------
+    pose_ckpt = os.path.join(MODEL_CACHE_DIR, "checkpoints", "block_pose_predictor.pt")
+    if os.path.exists(pose_ckpt):
+        print(f"  Block pose predictor checkpoint found <- {pose_ckpt}")
+    else:
+        pose_ckpt = None
+        print(f"  No block pose predictor checkpoint — "
+              f"every subgoal will train with the privileged ground-truth "
+              f"achieved_goal as its observation input "
+              f"(run train_pose_estimator.py first for the learned signal).")
+
+    # ------------------------------------------------------------------
+    # Trained align_xy actor (optional — only used when training `descend`
+    # specifically, to start each episode from wherever align_xy actually
+    # leaves the arm instead of a fresh scattered reset — see
+    # env/setup.py's _run_align_xy_until_done for why this needed fixing,
+    # 2026-07-24). Same checkpoint-path-only threading through worker
+    # processes as collision_ckpt/pose_ckpt above.
+    # ------------------------------------------------------------------
+    align_xy_ckpt = os.path.join(MODEL_CACHE_DIR, "checkpoints", "low_level_align_xy_ppo_best.pt")
+    if os.path.exists(align_xy_ckpt):
+        print(f"  Trained align_xy checkpoint found <- {align_xy_ckpt}")
+    else:
+        align_xy_ckpt = None
+        print(f"  No trained align_xy checkpoint — 'descend' will train from a fresh "
+              f"scattered reset (train align_xy first for the real deployment-matched setup).")
 
     def find_resume_checkpoint(subgoal: str, trainer: LowLevelPPOTrainer) -> int:
         """Same newest-compatible-checkpoint search as train_low_level.py's
@@ -162,7 +197,7 @@ def train_low_level_ppo(
                   f"architecture — starting fresh from iteration 0.")
         return 0
 
-    def make_eval_env(subgoal: str, collision_model):
+    def make_eval_env(subgoal: str, collision_model, pose_model, align_xy_policy=None):
         # +250, not *2: init_episode_before_subgoal's oracle pre-subgoal
         # setup (close_gripper/lift/move_to_target/release) needs headroom
         # on top of the actual episode — see rollout_workers.py's
@@ -174,6 +209,7 @@ def train_low_level_ppo(
         setup_env(base)
         return SubgoalConditionedEnv(
             base, subgoal=subgoal, collision_model=collision_model,
+            pose_model=pose_model, align_xy_policy=align_xy_policy,
             max_episode_steps=max_episode_steps,
         )
 
@@ -204,7 +240,8 @@ def train_low_level_ppo(
         trainer = LowLevelPPOTrainer(config)
 
         env_kwargs = dict(subgoal=subgoal, max_episode_steps=max_episode_steps,
-                           collision_ckpt=collision_ckpt)
+                           collision_ckpt=collision_ckpt, pose_ckpt=pose_ckpt,
+                           align_xy_ckpt=align_xy_ckpt)
 
         # Eval uses its own plain (non-pooled) env — 10 episodes is cheap
         # sequentially, no need to spin up the worker pool for it.
@@ -213,7 +250,23 @@ def train_low_level_ppo(
             eval_collision_model = CollisionPredictor()
             eval_collision_model.load_state_dict(torch.load(collision_ckpt, map_location="cpu"))
             eval_collision_model.eval()
-        eval_env = make_eval_env(subgoal, eval_collision_model)
+        eval_pose_model = None
+        if pose_ckpt is not None:
+            eval_pose_model = BlockPosePredictor()
+            eval_pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
+            eval_pose_model.eval()
+        # Only relevant for subgoal="descend" — see env_kwargs above / this
+        # file's align_xy_ckpt resolution comment.
+        eval_align_xy_policy = None
+        if align_xy_ckpt is not None and subgoal == "descend":
+            eval_align_xy_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+            align_xy_ckpt_data = torch.load(align_xy_ckpt, map_location="cpu")
+            eval_align_xy_policy.load_state_dict(
+                align_xy_ckpt_data["actor"] if isinstance(align_xy_ckpt_data, dict) and "actor" in align_xy_ckpt_data
+                else align_xy_ckpt_data
+            )
+            eval_align_xy_policy.eval()
+        eval_env = make_eval_env(subgoal, eval_collision_model, eval_pose_model, eval_align_xy_policy)
 
         start_iteration = 0
         if resume:
@@ -221,14 +274,18 @@ def train_low_level_ppo(
 
         # Same fixed-seed held-out eval convention as train_low_level.py —
         # see that script's comment for why FIXED (not just disjoint) matters.
-        def run_eval() -> float:
+        # actor param (defaults to trainer.actor) lets this also evaluate an
+        # ARBITRARY checkpoint's actor — used below to seed best_completion_rate
+        # from the existing best checkpoint, not just the one currently training.
+        def run_eval(actor=None) -> float:
+            actor = actor if actor is not None else trainer.actor
             completions = []
             for ep in range(eval_episodes):
                 rng = np.random.default_rng(90_000 + ep)
                 obs, info = eval_env.reset(rng=rng)
                 success = False
                 for _ in range(max_episode_steps):
-                    action = trainer.actor.act(obs, deterministic=True)
+                    action = actor.act(obs, deterministic=True)
                     obs, reward, terminated, truncated, info = eval_env.step(action)
                     if info.get("done", False):
                         success = True
@@ -238,7 +295,27 @@ def train_low_level_ppo(
             return float(np.mean(completions))
 
         best_ckpt_path = os.path.join(MODEL_CACHE_DIR, "checkpoints", f"low_level_{subgoal}_ppo_best.pt")
+        # Seed from the EXISTING best checkpoint's real performance, not a
+        # blind -1.0 — otherwise any fresh invocation of this script (e.g.
+        # --resume hitting an eval-only pass because training was already at
+        # n_iterations) can silently overwrite a previously-good _best.pt
+        # with whatever the CURRENT actor happens to be, even if that's
+        # worse. Confirmed 2026-07-24: exactly this happened to `lift` — a
+        # --resume run's eval-only pass landed on a 0%-completion checkpoint
+        # (the tail end of a training oscillation) and clobbered a real
+        # 100%-completion _best.pt from iteration 50/150 purely because
+        # 0.0 > -1.0. The underlying good weights survived only because the
+        # separate periodic _iter{N}.pt checkpoints are never overwritten by
+        # this logic — this fix closes the actual hole, not just the symptom.
         best_completion_rate = -1.0
+        if os.path.exists(best_ckpt_path):
+            probe_actor = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+            probe_ckpt = torch.load(best_ckpt_path, map_location="cpu")
+            probe_actor.load_state_dict(probe_ckpt["actor"] if isinstance(probe_ckpt, dict) and "actor" in probe_ckpt else probe_ckpt)
+            probe_actor.eval()
+            best_completion_rate = run_eval(probe_actor)
+            print(f"  [resume] {subgoal}: existing best checkpoint completion_rate={best_completion_rate:.1%} "
+                  f"(seeded from {best_ckpt_path})")
 
         def maybe_save_best(completion_rate: float) -> None:
             nonlocal best_completion_rate
@@ -275,10 +352,19 @@ def train_low_level_ppo(
                 history.append(metrics)
 
                 if (i + 1) % 10 == 0:
+                    def _fmt(key):
+                        v = metrics.get(key)
+                        return f"{v:.4f}" if v is not None else "n/a"
                     print(f"  iter {i+1}/{n_iterations}  policy_loss={metrics['policy_loss']:.4f}  "
                           f"value_loss={metrics['value_loss']:.4f}  mean_reward={metrics['mean_reward']:.4f}  "
                           f"entropy={metrics['mean_entropy']:.4f}  approx_kl={metrics['approx_kl']:.4f}  "
                           f"clip_frac={metrics['clip_fraction']:.3f}  "
+                          f"d_grip_block(init={_fmt('mean_initial_d_grip_block')}, "
+                          f"final={_fmt('mean_final_d_grip_block')})  "
+                          f"closedness={_fmt('mean_final_closedness')}  "
+                          f"translation_norm={_fmt('mean_final_translation_norm')}  "
+                          f"d_xy(init={_fmt('mean_initial_d_xy')}, final={_fmt('mean_final_d_xy')})  "
+                          f"d_z(init={_fmt('mean_initial_d_z')}, final={_fmt('mean_final_d_z')})  "
                           f"collect_s={metrics['collect_s']:.2f}  update_s={metrics['update_s']:.2f}")
 
                 if (i + 1) % checkpoint_every == 0:
@@ -354,6 +440,7 @@ def train_low_level_ppo(
 def main(
     subgoals: str = "align_xy,descend,close_gripper,lift,move_to_target,release",
     n_iterations: int = 300,
+    max_episode_steps: int = 30,
     resume: bool = False,
     resume_ckpt_iter: int = 0,
     n_rollouts: int = 0,
@@ -369,7 +456,8 @@ def main(
     early_stop_threshold: float = 1.0,
 ):
     print(f"\nDispatching PPO+GAE low-level controller training to Modal (CPU)...")
-    print(f"  subgoals={subgoals}  n_iterations={n_iterations}  resume={resume}  "
+    print(f"  subgoals={subgoals}  n_iterations={n_iterations}  max_episode_steps={max_episode_steps}  "
+          f"resume={resume}  "
           f"resume_ckpt_iter={resume_ckpt_iter or 'auto'}  "
           f"n_rollouts={n_rollouts or 'default'}  n_workers={n_workers}  "
           f"gamma={gamma or 'default'}  gae_lambda={'default' if gae_lambda < 0 else gae_lambda}  "
@@ -378,7 +466,8 @@ def main(
           f"minibatch_size={minibatch_size or 'default'}  "
           f"early_stop_patience={early_stop_patience}  early_stop_threshold={early_stop_threshold:.0%}\n")
     handle = train_low_level_ppo.spawn(
-        subgoals=subgoals, n_iterations=n_iterations, resume=resume, resume_ckpt_iter=resume_ckpt_iter,
+        subgoals=subgoals, n_iterations=n_iterations, max_episode_steps=max_episode_steps,
+        resume=resume, resume_ckpt_iter=resume_ckpt_iter,
         n_rollouts=n_rollouts, n_workers=n_workers, gamma=gamma, gae_lambda=gae_lambda,
         lr=lr, entropy_coef=entropy_coef, clip_eps=clip_eps, n_epochs=n_epochs, minibatch_size=minibatch_size,
         early_stop_patience=early_stop_patience, early_stop_threshold=early_stop_threshold,
