@@ -93,6 +93,13 @@ rl_image = (
         "bitsandbytes==0.43.3",
         # Experiment tracking — M6C training run
         "wandb>=0.17.0",
+        # NOTE: stable-baselines3 was tried here for the low-level subgoal
+        # controller and removed — its torch/gymnasium version requirements
+        # repeatedly conflicted with this project's pins (torch==2.3.0 for
+        # the Qwen2-VL stack). Replaced with a from-scratch GRPO trainer
+        # (training/low_level_grpo.py) reusing the same algorithm as this
+        # file's VLM GRPO trainer — no new dependency needed. See
+        # bugs_and_fixes memory, 2026-07-11, for the full story.
     )
 
     # --- Layer 4: local project package ---
