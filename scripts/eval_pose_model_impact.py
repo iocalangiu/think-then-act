@@ -56,7 +56,7 @@ def eval_pose_model_impact(
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
-    from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
 
     subgoal_list = [s.strip() for s in subgoals.split(",") if s.strip()]
     for s in subgoal_list:
@@ -135,7 +135,7 @@ def eval_pose_model_impact(
             results[subgoal] = None
             continue
 
-        actor = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+        actor = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal(subgoal))
         ckpt_data = torch.load(ckpt, map_location="cpu")
         # PPO checkpoints wrap {"actor":..., "critic":...}; GRPO checkpoints
         # are a bare state_dict — same distinction record_subgoal_video.py handles.
