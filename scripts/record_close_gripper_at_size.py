@@ -21,11 +21,20 @@ that axis (see init_random_episode's size_range/width_range/etc. params),
 so this reuses the SAME setup/spawn-height/oracle-handoff path every real
 training episode goes through, not a hand-rolled shortcut.
 
+--use-pose-model (default True, matching record_full_rollout.py's convention):
+when set, close_gripper's observation uses block_pose_predictor.pt's learned
+position estimate instead of ground-truth achieved_goal — same None-means-
+unchanged wiring subgoal_env.py already supports, just never plumbed through
+here before. Pass --no-use-pose-model to force ground truth (isolates the
+policy's own capability from the pose model's, the same A/B this project
+already ran for align_xy on 2026-08-19).
+
 Run with:
     modal run scripts/record_close_gripper_at_size.py --size 0.05
     modal run scripts/record_close_gripper_at_size.py --size 0.005 --tag out_of_dist
     modal run scripts/record_close_gripper_at_size.py --size 0.05 --use-best
     modal run scripts/record_close_gripper_at_size.py --size 0.05 --height 0.07 --use-best --tag tall
+    modal run scripts/record_close_gripper_at_size.py --size 0.01 --no-use-pose-model  # ground truth only
 """
 
 import modal
@@ -47,6 +56,7 @@ def record_close_gripper_at_size(
     ckpt_iter: int = 0,
     use_best: bool = False,
     video_fps: int = 10,
+    use_pose_model: bool = True,
 ) -> dict:
     import os
     import numpy as np
@@ -61,6 +71,7 @@ def record_close_gripper_at_size(
     from think_then_act.env.setup import setup_env, save_video as save_video_fn
     from think_then_act.env.wrapper import ObservationHarness
     from think_then_act.env.block_randomization import get_block_dims
+    from think_then_act.perception.block_pose_predictor import BlockPosePredictor
     from think_then_act.policy.subgoal_policy import SubgoalGaussianPolicy
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
@@ -87,6 +98,16 @@ def record_close_gripper_at_size(
     policy.load_state_dict(ckpt["actor"] if isinstance(ckpt, dict) and "actor" in ckpt else ckpt)
     policy.eval()
 
+    pose_model = None
+    pose_ckpt = os.path.join(ckpt_dir, "block_pose_predictor.pt")
+    if use_pose_model and os.path.exists(pose_ckpt):
+        pose_model = BlockPosePredictor()
+        pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
+        pose_model.eval()
+        print(f"  pose model        <- {pose_ckpt}")
+    elif not use_pose_model:
+        print(f"  pose model disabled (--no-use-pose-model) — using ground-truth achieved_goal")
+
     base = ObservationHarness(
         gym.make("FetchPickAndPlace-v3", render_mode="rgb_array", max_episode_steps=max_steps + 250)
     )
@@ -96,7 +117,7 @@ def record_close_gripper_at_size(
     # spawn-height/oracle-handoff path a real training episode uses.
     env = SubgoalConditionedEnv(
         base, subgoal=subgoal, max_episode_steps=max_steps,
-        randomize_block_size=True,
+        randomize_block_size=True, pose_model=pose_model,
         width_range=(width_val, width_val), length_range=(length_val, length_val),
         height_range=(height_val, height_val),
     )
@@ -158,11 +179,13 @@ def main(
     size: float = 0.05, width: float = 0.0, length: float = 0.0, height: float = 0.0,
     tag: str = "", seed: int = 0, max_steps: int = 30,
     lift_steps: int = 8, ckpt_iter: int = 0, use_best: bool = False, video_fps: int = 10,
+    use_pose_model: bool = True,
 ):
     result = record_close_gripper_at_size.remote(
         size=size, width=width, length=length, height=height,
         tag=tag, seed=seed, max_steps=max_steps, lift_steps=lift_steps,
         ckpt_iter=ckpt_iter, use_best=use_best, video_fps=video_fps,
+        use_pose_model=use_pose_model,
     )
     print(f"\nDone: {result}")
     print(f"\nDownload with:")
