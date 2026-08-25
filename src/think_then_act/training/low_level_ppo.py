@@ -263,6 +263,52 @@ class LowLevelPPOTrainer:
                 metrics_accum["clip_fraction"].append(clip_fraction)
 
         all_rewards = [r["total_reward"] for r in rollouts]
+        # Only present for close_gripper (see rollout_workers.py's
+        # _run_episode / subgoal_reward.py's reward_close_gripper). Both
+        # None (not 0/omitted) for every other subgoal.
+        #   initial_d_grip_block — how far the SETUP phase (env/setup.py's
+        #     init_episode_before_subgoal) landed from the block, before the
+        #     policy has acted at all. Should stay small and consistent
+        #     across iterations (it's a property of the setup, not the
+        #     policy) — if it drifts or the fallback-to-plain-reset path is
+        #     firing often, this would show it.
+        #   final_d_grip_block — where the gripper ended up after a full
+        #     episode of the policy acting. Should be near
+        #     close_gripper_drift_limit (0.05) or below on a healthy run;
+        #     consistently large values mean the arm is drifting away
+        #     rather than centering on the block before closing.
+        def _mean_or_none(key):
+            values = [r[key] for r in rollouts if r.get(key) is not None]
+            return float(np.mean(values)) if values else None
+
+        mean_initial_d_grip_block = _mean_or_none("initial_d_grip_block")
+        mean_final_d_grip_block   = _mean_or_none("final_d_grip_block")
+        # Also close_gripper-only (see reward_close_gripper's breakdown).
+        # final_closedness — how close finger_width landed to the
+        #   empirically-measured real-grasp target (Gaussian peak = 1.0,
+        #   see close_gripper_target_width); low values mean either still
+        #   open or closed past the object (closed on nothing).
+        # final_translation_norm — ||dx,dy,dz|| of the LAST action taken;
+        #   should trend down over training if the stillness penalty
+        #   (close_gripper_stillness_weight) is being learned.
+        mean_final_closedness       = _mean_or_none("final_closedness")
+        mean_final_translation_norm = _mean_or_none("final_translation_norm")
+
+        # align_xy/descend only (see reward_align_xy/reward_descend's
+        # breakdown) — initial_d_xy in particular is the diagnostic for
+        # the training/deployment mismatch hypothesis: descend's ISOLATED
+        # training reset is a plain fresh reset (env/setup.py says
+        # "align_xy/descend need no setup"), but the real chained rollout
+        # never runs descend from a fresh reset — it always starts wherever
+        # align_xy just left it, already xy-aligned. If mean_initial_d_xy
+        # here is large (i.e. descend rarely trains from an already-aligned
+        # start), that's the same class of distribution mismatch already
+        # found + fixed for close_gripper/lift/move_to_target/release.
+        mean_initial_d_xy = _mean_or_none("initial_d_xy")
+        mean_final_d_xy   = _mean_or_none("final_d_xy")
+        mean_initial_d_z  = _mean_or_none("initial_d_z")
+        mean_final_d_z    = _mean_or_none("final_d_z")
+
         return {
             "policy_loss"  : float(np.mean(metrics_accum["policy_loss"])),
             "value_loss"   : float(np.mean(metrics_accum["value_loss"])),
@@ -271,6 +317,14 @@ class LowLevelPPOTrainer:
             "clip_fraction": float(np.mean(metrics_accum["clip_fraction"])),
             "mean_reward"  : float(np.mean(all_rewards)),
             "std_reward"   : float(np.std(all_rewards)),
+            "mean_initial_d_grip_block": mean_initial_d_grip_block,
+            "mean_final_d_grip_block"  : mean_final_d_grip_block,
+            "mean_final_closedness"       : mean_final_closedness,
+            "mean_final_translation_norm" : mean_final_translation_norm,
+            "mean_initial_d_xy": mean_initial_d_xy,
+            "mean_final_d_xy"  : mean_final_d_xy,
+            "mean_initial_d_z" : mean_initial_d_z,
+            "mean_final_d_z"   : mean_final_d_z,
         }
 
     # ------------------------------------------------------------------
