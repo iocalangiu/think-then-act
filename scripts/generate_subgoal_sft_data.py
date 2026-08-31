@@ -680,7 +680,7 @@ def generate_subgoal_sft_data(
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.fetch_skills import build_fetch_skills
-    from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
 
     print(f"\n{'='*60}")
     print(f"  HIGH-LEVEL VLM SFT DATA GENERATION")
@@ -706,7 +706,7 @@ def generate_subgoal_sft_data(
     policies = {}
     for subgoal in trained_subgoals:
         ckpt = resolve_subgoal_checkpoint(ckpt_dir, subgoal, algo=algo, use_best=use_best)
-        policies[subgoal] = _load_actor(ckpt, obs_dim=SUBGOAL_OBS_DIM)
+        policies[subgoal] = _load_actor(ckpt, obs_dim=obs_dim_for_subgoal(subgoal))
         print(f"  {subgoal:14s}    <- {ckpt}")
 
     skills = build_fetch_skills(policies, collision_model)
