@@ -157,10 +157,12 @@ def test_build_obs_uses_pose_model_estimate_when_set():
 
 
 def test_build_obs_sanitizes_object_pos_and_object_rel_pos_not_just_achieved_goal():
-    """The specific regression this guards: object_pos/object_rel_pos
-    (obs[3:6], obs[6:9]) must not leak the TRUE block position through once
-    a pose model is active, even though build_subgoal_observation's
-    achieved_goal argument is correctly using the perceived estimate."""
+    """The specific regression this guards, updated 2026-09-01 for
+    align_xy's new RELATIVE_OBS_SUBGOALS layout (subgoal_features.py):
+    align_xy no longer HAS a separate absolute object_pos field at all
+    (that's the actual fix — see RELATIVE_OBS_DIM's comment) — the one
+    remaining position-derived field is object_rel_pos at got[0:3], which
+    must be computed from the PERCEIVED achieved_goal, not the true one."""
     pose_model = _CountingPoseModel(pos=(9.0, 9.0, 9.0))
     skills = build_fetch_skills({"align_xy": _FakePolicy()}, pose_model=pose_model, max_steps=30)
     obs = _make_obs()
@@ -168,10 +170,9 @@ def test_build_obs_sanitizes_object_pos_and_object_rel_pos_not_just_achieved_goa
 
     got = skills["align_xy"].build_obs(obs, base_env)
     grip_pos = obs["observation"][0:3]
-    np.testing.assert_allclose(got[3:6], pose_model.pos)
-    np.testing.assert_allclose(got[6:9], pose_model.pos - grip_pos)
-    # The TRUE achieved_goal must NOT appear anywhere in those slices.
-    assert not np.allclose(got[3:6], obs["achieved_goal"])
+    np.testing.assert_allclose(got[0:3], pose_model.pos - grip_pos)
+    # The TRUE achieved_goal must NOT appear anywhere in that slice.
+    assert not np.allclose(got[0:3], obs["achieved_goal"] - grip_pos)
 
 
 def test_reward_and_done_stays_on_ground_truth_regardless_of_pose_model():

@@ -7,6 +7,9 @@ import pytest
 
 from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
 from think_then_act.training.subgoal_features import (
+    CLOSE_GRIPPER_OBS_DIM,
+    RELATIVE_OBS_DIM,
+    RELATIVE_OBS_SUBGOALS,
     SUBGOAL_OBS_DIM,
     build_subgoal_observation,
     sanitize_observation_for_perception,
@@ -15,12 +18,110 @@ from think_then_act.training.subgoal_features import (
 
 
 def test_subgoal_obs_dim_matches_the_actual_concatenation():
+    # "lift" here (not "align_xy"/"descend") — both of those are now in
+    # RELATIVE_OBS_SUBGOALS with their own SMALLER layout, see the
+    # RELATIVE_OBS_SUBGOALS-specific tests below.
     obs   = np.zeros(25)
     block = [1.3, 0.75, 0.425]
     target = [1.5, 0.75, 0.425]
-    flat = build_subgoal_observation(obs, block, target, "align_xy", collision_prob=0.0)
+    flat = build_subgoal_observation(obs, block, target, "lift", collision_prob=0.0)
     assert flat.shape == (SUBGOAL_OBS_DIM,)
     assert flat.dtype == np.float32
+
+
+@pytest.mark.parametrize("subgoal", sorted(RELATIVE_OBS_SUBGOALS))
+def test_relative_obs_subgoal_observation_is_the_smaller_relative_layout(subgoal):
+    obs   = np.arange(25, dtype=np.float32)
+    block = [1.3, 0.75, 0.425]
+    target = [1.5, 0.75, 0.425]
+
+    flat = build_subgoal_observation(obs, block, target, subgoal, collision_prob=0.0)
+
+    assert flat.shape == (RELATIVE_OBS_DIM,)
+    assert RELATIVE_OBS_DIM == SUBGOAL_OBS_DIM - 9
+    assert flat.dtype == np.float32
+
+
+@pytest.mark.parametrize("subgoal", sorted(RELATIVE_OBS_SUBGOALS))
+def test_relative_obs_subgoal_observation_is_invariant_to_a_global_translation(subgoal):
+    # The whole point of this layout: translate grip_pos, block_pos, and
+    # target by the SAME arbitrary vector (simulating a different
+    # coordinate frame's origin, e.g. sim world-frame vs real base_link
+    # frame) and the fed observation must come out byte-identical — see
+    # RELATIVE_OBS_SUBGOALS's comment in subgoal_features.py for why.
+    rng = np.random.default_rng(0)
+    obs = rng.normal(size=25).astype(np.float32)
+    block  = np.array([1.3, 0.75, 0.425], dtype=np.float32)
+    target = np.array([1.5, 0.75, 0.425], dtype=np.float32)
+    shift = np.array([-1.9, 0.4, -0.6], dtype=np.float32)   # arbitrary, nonzero on every axis
+
+    obs_shifted = obs.copy()
+    obs_shifted[0:3] += shift   # grip_pos
+    obs_shifted[3:6] += shift   # object_pos (unused by this layout, but shift it anyway)
+
+    flat          = build_subgoal_observation(obs,         block,         target,         subgoal, collision_prob=0.3)
+    flat_shifted  = build_subgoal_observation(obs_shifted,  block + shift, target + shift, subgoal, collision_prob=0.3)
+
+    np.testing.assert_allclose(flat, flat_shifted, atol=1e-5)
+
+
+@pytest.mark.parametrize("subgoal", sorted(RELATIVE_OBS_SUBGOALS))
+def test_relative_obs_subgoal_observation_has_no_close_gripper_block_dims_leak(subgoal):
+    # block_dims is close_gripper-only — passing it here must be a silent
+    # no-op, same guarantee test_other_subgoals_ignore_block_dims_even_if_
+    # passed already gives the other non-RELATIVE_OBS_SUBGOALS subgoals.
+    obs   = np.zeros(25)
+    block = [1.3, 0.75, 0.425]
+    target = [1.5, 0.75, 0.425]
+
+    without = build_subgoal_observation(obs, block, target, subgoal, collision_prob=0.0)
+    with_dims = build_subgoal_observation(obs, block, target, subgoal, collision_prob=0.0,
+                                           block_dims=[0.03, 0.05, 0.04])
+
+    assert without.shape == (RELATIVE_OBS_DIM,)
+    np.testing.assert_array_equal(without, with_dims)
+
+
+def test_close_gripper_observation_is_wider_and_appends_block_dims():
+    obs   = np.zeros(25)
+    block = [1.3, 0.75, 0.425]
+    target = [1.5, 0.75, 0.425]
+    dims = [0.03, 0.05, 0.04]   # [width, length, height]
+
+    flat = build_subgoal_observation(obs, block, target, "close_gripper", collision_prob=0.0,
+                                      block_dims=dims)
+
+    assert flat.shape == (CLOSE_GRIPPER_OBS_DIM,)
+    assert CLOSE_GRIPPER_OBS_DIM == SUBGOAL_OBS_DIM + 3
+    np.testing.assert_allclose(flat[-3:], dims)
+
+
+def test_close_gripper_observation_defaults_block_dims_to_zero():
+    obs   = np.zeros(25)
+    block = [1.3, 0.75, 0.425]
+    target = [1.5, 0.75, 0.425]
+
+    flat = build_subgoal_observation(obs, block, target, "close_gripper", collision_prob=0.0)
+
+    assert flat.shape == (CLOSE_GRIPPER_OBS_DIM,)
+    np.testing.assert_allclose(flat[-3:], [0.0, 0.0, 0.0])
+
+
+def test_other_subgoals_ignore_block_dims_even_if_passed():
+    # Passing block_dims for a subgoal that isn't close_gripper must be a
+    # silent no-op — the vector length/content must be byte-identical to
+    # not passing it at all, so the other 5 subgoals' existing checkpoints
+    # never see an unexpected shape change.
+    obs   = np.zeros(25)
+    block = [1.3, 0.75, 0.425]
+    target = [1.5, 0.75, 0.425]
+
+    without = build_subgoal_observation(obs, block, target, "lift", collision_prob=0.0)
+    with_dims = build_subgoal_observation(obs, block, target, "lift", collision_prob=0.0,
+                                           block_dims=[0.03, 0.05, 0.04])
+
+    assert without.shape == (SUBGOAL_OBS_DIM,)
+    np.testing.assert_array_equal(without, with_dims)
 
 
 def test_onehot_is_one_hot_and_matches_label_index():
@@ -43,17 +144,18 @@ def test_build_observation_rejects_unknown_subgoal():
 
 
 def test_build_observation_encodes_collision_prob_and_subgoal_correctly():
+    # "lift" here, not "descend" — descend is now in RELATIVE_OBS_SUBGOALS.
     obs = np.arange(25, dtype=np.float32)
     block = [1.0, 2.0, 3.0]
     target = [4.0, 5.0, 6.0]
-    flat = build_subgoal_observation(obs, block, target, "descend", collision_prob=0.42)
+    flat = build_subgoal_observation(obs, block, target, "lift", collision_prob=0.42)
 
     # Layout: obs(25) | achieved(3) | desired(3) | onehot(6) | collision_prob(1)
     np.testing.assert_allclose(flat[0:25], obs)
     np.testing.assert_allclose(flat[25:28], block)
     np.testing.assert_allclose(flat[28:31], target)
     onehot = flat[31:31 + len(SUBGOAL_LABELS)]
-    np.testing.assert_allclose(onehot, subgoal_to_onehot("descend"))
+    np.testing.assert_allclose(onehot, subgoal_to_onehot("lift"))
     assert flat[-1] == pytest.approx(0.42)
 
 
