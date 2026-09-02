@@ -43,8 +43,11 @@ def _worker_init(env_kwargs: dict) -> None:
 
     from think_then_act.env.setup import setup_env
     from think_then_act.env.wrapper import ObservationHarness
+    from think_then_act.perception.block_pose_predictor import BlockPosePredictor
     from think_then_act.perception.collision_predictor import CollisionPredictor
+    from think_then_act.policy.subgoal_policy import SubgoalGaussianPolicy
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
 
     collision_model = None
     ckpt = env_kwargs.get("collision_ckpt")
@@ -52,6 +55,29 @@ def _worker_init(env_kwargs: dict) -> None:
         collision_model = CollisionPredictor()
         collision_model.load_state_dict(torch.load(ckpt, map_location="cpu"))
         collision_model.eval()
+
+    # Same never-pickle-the-live-module treatment as collision_model above —
+    # each worker loads its own copy from the checkpoint PATH.
+    pose_model = None
+    pose_ckpt = env_kwargs.get("pose_ckpt")
+    if pose_ckpt:
+        pose_model = BlockPosePredictor()
+        pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
+        pose_model.eval()
+
+    # Only relevant for subgoal="descend" (env/setup.py's
+    # init_episode_before_subgoal ignores it otherwise) — only load it for
+    # descend's own worker pool, not the other five subgoals' pools.
+    align_xy_policy = None
+    align_xy_ckpt = env_kwargs.get("align_xy_ckpt")
+    if align_xy_ckpt and env_kwargs.get("subgoal") == "descend":
+        align_xy_policy = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal("align_xy"))
+        align_xy_ckpt_data = torch.load(align_xy_ckpt, map_location="cpu")
+        align_xy_policy.load_state_dict(
+            align_xy_ckpt_data["actor"] if isinstance(align_xy_ckpt_data, dict) and "actor" in align_xy_ckpt_data
+            else align_xy_ckpt_data
+        )
+        align_xy_policy.eval()
 
     max_episode_steps = env_kwargs["max_episode_steps"]
     # +250, not *2: env/setup.py's init_episode_before_subgoal can spend up
@@ -66,9 +92,15 @@ def _worker_init(env_kwargs: dict) -> None:
                   max_episode_steps=max_episode_steps + 250)
     )
     setup_env(base)
+    env_extra_kwargs = {}
+    if "done_streak" in env_kwargs:
+        env_extra_kwargs["close_gripper_done_streak"] = env_kwargs["done_streak"]
     env = SubgoalConditionedEnv(
         base, subgoal=env_kwargs["subgoal"], collision_model=collision_model,
-        max_episode_steps=max_episode_steps,
+        pose_model=pose_model, align_xy_policy=align_xy_policy, max_episode_steps=max_episode_steps,
+        randomize_block_size=env_kwargs.get("randomize_block_size", False),
+        size_range=env_kwargs.get("size_range"),
+        **env_extra_kwargs,
     )
     _WORKER_ENV       = env
     _WORKER_MAX_STEPS = max_episode_steps
@@ -107,12 +139,31 @@ def _run_episode(actor, critic, seed: int) -> dict:
     initial_d_grip_block = info.get("d_grip_block")
     if initial_d_grip_block is not None:
         initial_d_grip_block = float(initial_d_grip_block)
+    # d_xy/d_z: present for align_xy/descend (see reward_align_xy/
+    # reward_descend's breakdown) — added to check whether descend's
+    # ISOLATED training reset (a plain fresh reset, per
+    # env/setup.py's "align_xy/descend need no setup") actually ever
+    # starts already-xy-aligned the way the real chained rollout always
+    # does (descend only ever runs right after align_xy in practice).
+    # If initial_d_xy is rarely small here, that's a training/deployment
+    # distribution mismatch, the same class of bug already found for
+    # close_gripper/lift/move_to_target/release on 2026-07-14 — descend
+    # was assumed exempt since align_xy IS always first, but descend
+    # itself never is.
+    initial_d_xy = info.get("d_xy")
+    if initial_d_xy is not None:
+        initial_d_xy = float(initial_d_xy)
+    initial_d_z = info.get("d_z")
+    if initial_d_z is not None:
+        initial_d_z = float(initial_d_z)
 
     steps = []
     terminated = truncated = False
     final_d_grip_block   = None   # only present in info for close_gripper (see subgoal_reward.py)
     final_closedness     = None   # ditto — how peaked/on-target the finger width ended up
     final_translation_norm = None # ditto — ||dx,dy,dz|| of the LAST action taken
+    final_d_xy = None   # only present in info for align_xy/descend
+    final_d_z  = None   # only present in info for descend
     with torch.no_grad():
         for _ in range(_WORKER_MAX_STEPS):
             obs_arr = np.asarray(obs, dtype=np.float32)
@@ -128,6 +179,10 @@ def _run_episode(actor, critic, seed: int) -> dict:
                 final_closedness = float(info["closedness"])
             if "translation_norm" in info:
                 final_translation_norm = float(info["translation_norm"])
+            if "d_xy" in info:
+                final_d_xy = float(info["d_xy"])
+            if "d_z" in info:
+                final_d_z = float(info["d_z"])
             steps.append({
                 "obs"         : obs_arr,
                 "raw_sample"  : raw_sample_t.squeeze(0).numpy(),
@@ -155,6 +210,10 @@ def _run_episode(actor, critic, seed: int) -> dict:
         "final_d_grip_block"   : final_d_grip_block,
         "final_closedness"       : final_closedness,
         "final_translation_norm" : final_translation_norm,
+        "initial_d_xy" : initial_d_xy,
+        "final_d_xy"   : final_d_xy,
+        "initial_d_z"  : initial_d_z,
+        "final_d_z"    : final_d_z,
     }
 
 
