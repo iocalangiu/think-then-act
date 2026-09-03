@@ -52,6 +52,26 @@ class SubgoalConditionedEnv(gym.Wrapper):
         subgoal: str,
         collision_model: CollisionPredictor = None,
         pose_model: BlockPosePredictor = None,
+        pos_noise_std: float = 0.0,   # metres — additive per-step Gaussian noise on
+                                 # the perceived block position, sampled fresh every
+                                 # reset()/step() call (NOT once per episode, unlike
+                                 # _perceived_block_dims' noise — a real pose CNN
+                                 # re-predicts from a new frame every step, so its
+                                 # error should jitter step-to-step too). Only
+                                 # applied when pose_model is None (mutually
+                                 # exclusive — a real model's own prediction error
+                                 # already stands in for this). Added 2026-09-03 to
+                                 # let align_xy/descend train against a GENERIC
+                                 # perception-noise stand-in instead of
+                                 # block_pose_predictor.pt specifically, since that
+                                 # model's own small-block localization failure
+                                 # (hierarchical_architecture memory, 2026-08-19/20)
+                                 # was confounding align_xy's own precision tuning,
+                                 # and the real robot currently uses a fixed known
+                                 # target coordinate anyway (no CNN in the loop).
+                                 # Reward/done keep using obs["achieved_goal"]
+                                 # directly regardless — same ground-truth-success
+                                 # convention as pose_model.
         align_xy_policy=None,   # optional trained align_xy actor — only used when
                                  # subgoal="descend", to start each episode from
                                  # wherever align_xy actually leaves the arm instead
@@ -119,6 +139,7 @@ class SubgoalConditionedEnv(gym.Wrapper):
         super().__init__(env)
         self.collision_model       = collision_model
         self.pose_model            = pose_model
+        self.pos_noise_std         = pos_noise_std
         self.align_xy_policy       = align_xy_policy
         self.max_episode_steps     = max_episode_steps
         self.randomize_each_episode = randomize_each_episode
@@ -135,6 +156,12 @@ class SubgoalConditionedEnv(gym.Wrapper):
         # scenes rather than one fixed block/target position for the whole
         # training run.
         self._episode_rng = np.random.default_rng()
+        # Reassigned in reset() to whatever rng that call actually used (the
+        # explicit override if given, else self._episode_rng) so pos_noise_std's
+        # per-step draws stay reproducible under a fixed-seed reset(rng=...) —
+        # e.g. train_low_level_ppo.py's run_eval creates a fresh seeded rng per
+        # eval episode specifically for this kind of determinism.
+        self._noise_rng = self._episode_rng
         self._step_count = 0
         self.set_subgoal(subgoal)   # also sets self.observation_space (see set_subgoal)
         self.action_space = env.action_space
@@ -215,16 +242,23 @@ class SubgoalConditionedEnv(gym.Wrapper):
 
     def _perceived_block_pos(self, obs: dict) -> np.ndarray:
         """
-        Ground truth (obs["achieved_goal"]) when no pose_model is set — same
-        None-means-unchanged-behavior convention as collision_model. Reward/
-        done (compute_subgoal_reward, called separately in reset()/step())
-        deliberately keeps using obs["achieved_goal"] directly, NOT this —
-        only the policy's observation input switches to the learned
-        estimate. See perception/block_pose_predictor.py's docstring for why.
+        pose_model's prediction if set; else ground truth (obs["achieved_goal"])
+        plus pos_noise_std Gaussian noise if that's set; else ground truth
+        unchanged — same None-means-unchanged-behavior convention as
+        collision_model. Reward/done (compute_subgoal_reward, called
+        separately in reset()/step()) deliberately keeps using
+        obs["achieved_goal"] directly, NOT this — only the policy's
+        observation input is ever perturbed. See
+        perception/block_pose_predictor.py's docstring for why pose_model
+        works this way; pos_noise_std is a generic stand-in for the same
+        idea when no trained pose model is in the loop.
         """
-        if self.pose_model is None:
-            return obs["achieved_goal"]
-        return self.pose_model.predict_position(self.env.last_frame())
+        if self.pose_model is not None:
+            return self.pose_model.predict_position(self.env.last_frame())
+        if self.pos_noise_std > 0:
+            noise = self._noise_rng.normal(0.0, self.pos_noise_std, size=3)
+            return (np.asarray(obs["achieved_goal"], dtype=np.float64) + noise).astype(np.float32)
+        return obs["achieved_goal"]
 
     def _flat_obs(self, obs: dict, collision_prob: float, perceived_block_pos: np.ndarray) -> np.ndarray:
         # obs["observation"] itself bakes in the TRUE block position twice
@@ -255,6 +289,7 @@ class SubgoalConditionedEnv(gym.Wrapper):
         obs, info = self.env.reset(**kwargs)
         if self.randomize_each_episode:
             active_rng = rng if rng is not None else self._episode_rng
+            self._noise_rng = active_rng   # see __init__'s comment on _noise_rng
             # For close_gripper/lift/move_to_target/release (subgoals that
             # only make sense once an earlier one already succeeded), this
             # fast-forwards a scripted oracle to the matching handoff state

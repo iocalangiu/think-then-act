@@ -32,7 +32,7 @@ def _make_obs(grip_pos, finger_widths=(0.05, 0.05)):
 # align_xy
 # ---------------------------------------------------------------------------
 def test_align_xy_improves_as_gripper_approaches_block_xy():
-    # close_obs is within align_xy_threshold=0.02 (d_xy ~0.0028).
+    # close_obs is within align_xy_threshold=0.005 (d_xy ~0.0028).
     block = [1.3, 0.75, 0.5]
     far_obs   = _make_obs([1.0, 0.75, 0.6])
     close_obs = _make_obs([1.2975, 0.7505, 0.6])

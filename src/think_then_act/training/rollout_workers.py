@@ -100,6 +100,7 @@ def _worker_init(env_kwargs: dict) -> None:
         pose_model=pose_model, align_xy_policy=align_xy_policy, max_episode_steps=max_episode_steps,
         randomize_block_size=env_kwargs.get("randomize_block_size", False),
         size_range=env_kwargs.get("size_range"),
+        pos_noise_std=env_kwargs.get("pos_noise_std", 0.0),
         **env_extra_kwargs,
     )
     _WORKER_ENV       = env
