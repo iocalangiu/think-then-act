@@ -90,6 +90,23 @@ def rasterize_top_down(xyz: np.ndarray, rgb: np.ndarray, out_width=640, out_heig
     return image
 
 
+def depth_to_color(z: np.ndarray) -> np.ndarray:
+    """Map depth values to a near=red / far=blue gradient (Nx3 uint8).
+
+    Plain 2-channel gradient instead of a real colormap (e.g. matplotlib's
+    viridis) since matplotlib's availability on the Construct session isn't
+    confirmed -- this needs zero extra dependencies. NaN entries (invalid
+    points) are pushed to mid-gray rather than left to propagate as NaN.
+    """
+    z_min, z_max = float(np.nanmin(z)), float(np.nanmax(z))
+    z_norm = (z - z_min) / max(z_max - z_min, 1e-6)
+    z_norm = np.nan_to_num(z_norm, nan=0.5)
+    rgb = np.zeros((z.shape[0], 3), dtype=np.uint8)
+    rgb[:, 0] = (255 * (1 - z_norm)).astype(np.uint8)  # near -> red
+    rgb[:, 2] = (255 * z_norm).astype(np.uint8)          # far -> blue
+    return rgb
+
+
 def write_image(image: np.ndarray, path: str) -> str:
     try:
         from PIL import Image
@@ -119,6 +136,12 @@ def main():
     parser.add_argument("output", nargs="?", default=DEFAULT_OUTPUT)
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     parser.add_argument("--timeout-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--color-depth", action="store_true",
+        help="Color pixels by depth (near=red, far=blue) instead of by the "
+        "point's own RGB -- useful when RGB rasterization is too sparse to "
+        "make out shapes (see decode_points/rasterize_top_down docstrings).",
+    )
     args = parser.parse_args()
 
     rclpy.init()
@@ -161,14 +184,16 @@ def main():
         f"z (depth) range [{vxyz[:, 2].min():.3f}, {vxyz[:, 2].max():.3f}] meters"
     )
 
+    color_source = depth_to_color(xyz[:, 2]) if args.color_depth else rgb
+
     if organized:
-        image = rgb.reshape(msg.height, msg.width, 3)
+        image = color_source.reshape(msg.height, msg.width, 3)
     else:
         node.get_logger().warning(
             "Cloud is unorganized -- rasterizing an approximate top-down "
             "projection from point positions, not the literal camera image."
         )
-        image = rasterize_top_down(vxyz, rgb[valid])
+        image = rasterize_top_down(vxyz, color_source[valid])
 
     out_path = write_image(image, args.output)
     node.get_logger().info(f"Wrote {image.shape[1]}x{image.shape[0]} snapshot to {out_path}")
