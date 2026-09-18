@@ -175,15 +175,22 @@ class SingularityForceAugmentedEnv(gym.Wrapper):
         info["perturbed_grip_force"] = perturbed_forces
         info["force_onset_flag"] = onset_flag
 
-        augmented = self._augment_precomputed(flat_obs, discrepancy, onset_flag, onset_trace)
+        augmented = self._augment(flat_obs, discrepancy, onset_flag, onset_trace)
         return augmented, reward, terminated, truncated, info
 
-    def _augment(self, flat_obs, discrepancy: np.ndarray, raw_forces: dict) -> np.ndarray:
+    def _augment(self, flat_obs, discrepancy: np.ndarray, onset_flag: float, onset_trace: float) -> np.ndarray:
+        """
+        Assembles the final observation from ALREADY-COMPUTED discrepancy/
+        onset features — never calls _force_onset_features itself, since
+        that function advances per-episode state (baseline window, onset
+        latch) and must be called exactly once per step (reset()/step()
+        each call it themselves, once, so they can also surface onset_flag
+        in `info` without a second, state-mutating call).
+        """
         parts = [np.asarray(flat_obs, dtype=np.float32)]
         if self.include_discrepancy_obs:
             parts.append(np.asarray(discrepancy, dtype=np.float32))
         if self.include_force_obs:
-            onset_flag, onset_trace = self._force_onset_features(raw_forces)
             parts.append(np.array([onset_flag, onset_trace], dtype=np.float32))
         return np.concatenate(parts)
 

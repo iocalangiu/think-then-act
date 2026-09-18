@@ -123,6 +123,19 @@ def sample_force_perturbation(
     return dict(state)
 
 
+def get_singularity_perturbation_state(model) -> dict | None:
+    """
+    Read back this episode's sampled singularity-perturbation state (see
+    sample_singularity_perturbation) — None if never sampled for this
+    model. For post-hoc diagnostics only (e.g. recovery-time metrics in
+    training/rollout_workers.py's _run_episode_recurrent) — never used for
+    control flow that affects apply_singularity_perturbation itself, which
+    reads _EPISODE_STATE directly.
+    """
+    state = _EPISODE_STATE.get(id(model), {}).get("singularity")
+    return dict(state) if state is not None else None
+
+
 def apply_force_perturbation(model, rng, raw_forces: dict) -> dict:
     """
     raw_forces: {"left": float, "right": float} from grip_contact_forces().
