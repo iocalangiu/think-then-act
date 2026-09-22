@@ -61,6 +61,19 @@ Run with:
 
 Output (on the volume, under /model-cache/subgoal_videos/):
     full_rollout_seed{seed}{_ppo}{_to_<last_subgoal> if not the full chain}.mp4
+    — or, when a size is pinned (see below), full_rollout_w{}_l{}_h{}{tag}{...}.mp4,
+    same naming convention as scripts/record_close_gripper_at_size.py's videos, so
+    the two are directly comparable file-for-file.
+
+--size/--width/--length/--height: pin the block to an EXACT size for the whole
+episode instead of the base env's single fixed 5cm cube — same degenerate
+(x, x) size_range mechanism record_close_gripper_at_size.py uses (defaults to
+a uniform cube via --size, --width/--length/--height each independently
+override one axis for a non-cube shape). All zero (default) leaves behavior
+byte-for-byte unchanged (randomize_block_size stays False, the original fixed
+cube). Lets a chained rollout be recorded at the SAME sizes already used for
+close_gripper's own generalization check (artifacts/close_gripper_size_videos),
+directly comparing single-subgoal vs. full-chain behavior at each size.
 
 Download with:
     python3 -m modal volume get rl-harness-model-cache subgoal_videos/ ./artifacts/subgoal_videos/
@@ -87,6 +100,14 @@ def record_full_rollout(
     use_pose_model: bool = True,  # False: force ground-truth achieved_goal even if a
                               # block_pose_predictor.pt checkpoint exists — lets the chain
                               # be A/B'd with vs. without perception noise on the same seed.
+    size: float = 0.0,       # 0.0 = no pin, use the base env's fixed 5cm cube (unchanged
+                              # default behavior). >0: pin ALL axes to this value (a
+                              # uniform cube) unless width/length/height overrides one.
+    width: float = 0.0,      # 0.0 = use `size` for this axis
+    length: float = 0.0,     # 0.0 = use `size` for this axis
+    height: float = 0.0,     # 0.0 = use `size` for this axis
+    tag: str = "",           # optional filename suffix, e.g. "tall"/"out_of_dist" —
+                              # same convention as record_close_gripper_at_size.py's --tag
 ) -> dict:
     import os
     import json
@@ -100,7 +121,8 @@ def record_full_rollout(
     import gymnasium as gym
     import gymnasium_robotics  # noqa: F401
 
-    from think_then_act.env.setup import setup_env, save_video, init_random_episode
+    from think_then_act.env.setup import setup_env, save_video, init_random_episode, TABLE_TOP_Z
+    from think_then_act.env.block_randomization import get_block_dims
     from think_then_act.env.wrapper import ObservationHarness
     from think_then_act.perception.block_pose_predictor import BlockPosePredictor
     from think_then_act.perception.collision_predictor import CollisionPredictor
@@ -108,7 +130,7 @@ def record_full_rollout(
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS, DEFAULT_WEIGHTS
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.fetch_skills import build_fetch_skills
-    from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
 
     requested = {s.strip() for s in subgoals.split(",") if s.strip()}
     unknown = requested - set(SUBGOAL_LABELS)
@@ -135,7 +157,7 @@ def record_full_rollout(
     for subgoal in subgoal_list:
         ckpt_path = resolve_subgoal_checkpoint(ckpt_dir, subgoal, algo=algo, use_best=use_best)
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+        policy = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal(subgoal))
         # PPO checkpoints (low_level_ppo.py's save_checkpoint) are
         # {"actor": ..., "critic": ...}; GRPO checkpoints are a flat
         # state_dict, loaded as-is — same convention as record_subgoal_video.py.
@@ -181,9 +203,33 @@ def record_full_rollout(
     setup_env(base)
     base.reset()
     rng = np.random.default_rng(seed)
-    obs, ok = init_random_episode(base, rng)
+
+    # Degenerate (x, x) ranges -> block_randomization.py's sampler always
+    # picks exactly that value on each axis — same mechanism
+    # record_close_gripper_at_size.py uses, going through the SAME
+    # spawn-height path a real (randomized) episode uses rather than a
+    # hand-rolled shortcut. All-zero (default) leaves randomize_block_size
+    # False, i.e. the original fixed 5cm cube, unchanged.
+    width_val  = width  or size
+    length_val = length or size
+    height_val = height or size
+    pin_size = bool(width_val or length_val or height_val)
+    randomize_kwargs = {}
+    if pin_size:
+        randomize_kwargs = dict(
+            randomize_block_size=True,
+            width_range=(width_val, width_val) if width_val else None,
+            length_range=(length_val, length_val) if length_val else None,
+            height_range=(height_val, height_val) if height_val else None,
+        )
+
+    obs, ok = init_random_episode(base, rng, **randomize_kwargs)
     if not ok:
         raise RuntimeError(f"init_random_episode failed for seed={seed}; try a different seed")
+
+    actual_dims = get_block_dims(base.unwrapped.model)
+    if pin_size:
+        print(f"  pinned block dims -> {actual_dims}")
 
     # ------------------------------------------------------------------
     # Overlay: requested subgoal names, top-right, always black; the one
@@ -286,7 +332,12 @@ def record_full_rollout(
     # ------------------------------------------------------------------
     grip_pos  = np.asarray(obs["observation"][0:3], dtype=np.float64)
     block_pos = np.asarray(obs["achieved_goal"], dtype=np.float64)
-    height_above_table = float(block_pos[2] - DEFAULT_WEIGHTS.table_z)
+    # THIS episode's own resting height, not the fixed DEFAULT_WEIGHTS.table_z
+    # constant (only correct for the original 5cm cube) — same fix reward_lift
+    # already applies via block_half_height, needed here too now that a size
+    # can be pinned away from 5cm (harmless no-op at the default 5cm size).
+    resting_z = TABLE_TOP_Z + actual_dims["height"] / 2.0
+    height_above_table = float(block_pos[2] - resting_z)
     d_grip_block = float(np.linalg.norm(block_pos - grip_pos))
     grasp_lift_success = bool(
         height_above_table >= DEFAULT_WEIGHTS.lift_height
@@ -298,7 +349,14 @@ def record_full_rollout(
     suffix = "_ppo" if algo == "ppo" else ""
     pose_tag = "_perceived" if pose_model is not None else ""
     chain_tag = "" if subgoal_list == SUBGOAL_LABELS else f"_to_{subgoal_list[-1]}"
-    out_path = os.path.join(out_dir, f"full_rollout_seed{seed}{suffix}{pose_tag}{chain_tag}.mp4")
+    if pin_size:
+        # Same w{}_l{}_h{}{tag} naming as record_close_gripper_at_size.py's
+        # videos, so the two are directly file-name-comparable at each size.
+        size_tag = f"w{actual_dims['width']:.4f}_l{actual_dims['length']:.4f}_h{actual_dims['height']:.4f}"
+        tag_suffix = f"_{tag}" if tag else ""
+        out_path = os.path.join(out_dir, f"full_rollout_{size_tag}{tag_suffix}{suffix}{pose_tag}{chain_tag}_seed{seed}.mp4")
+    else:
+        out_path = os.path.join(out_dir, f"full_rollout_seed{seed}{suffix}{pose_tag}{chain_tag}.mp4")
     save_video(frames, out_path, fps=10)
     model_volume.commit()
 
@@ -328,12 +386,15 @@ def main(
     seed: int = 0, subgoals: str = "align_xy,descend,close_gripper,lift,move_to_target,release",
     max_steps_per_subgoal: int = 30,
     algo: str = "ppo", use_best: bool = True, use_pose_model: bool = True,
+    size: float = 0.0, width: float = 0.0, length: float = 0.0, height: float = 0.0, tag: str = "",
 ):
     print(f"\nRecording chained rollout ({subgoals}), "
-          f"seed={seed} algo={algo} use_best={use_best} use_pose_model={use_pose_model}...")
+          f"seed={seed} algo={algo} use_best={use_best} use_pose_model={use_pose_model} "
+          f"size={size} width={width} length={length} height={height} tag={tag!r}...")
     result = record_full_rollout.remote(
         seed=seed, subgoals=subgoals, max_steps_per_subgoal=max_steps_per_subgoal,
         algo=algo, use_best=use_best, use_pose_model=use_pose_model,
+        size=size, width=width, length=length, height=height, tag=tag,
     )
     print(f"\nDone. task_success={result['task_success']}  grasp_lift_success={result['grasp_lift_success']}")
     for s in result["summary"]:
