@@ -29,6 +29,35 @@ For example, if `(Δx=8, Δy)` succeeds and `(Δx=9, Δy)` fails, the model lear
 
 It turned out I was using the wrong action representation (floats, then bins), and the wrong way to use a VLM for continuous control in the first place.
 
+## Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy
+
+I fine-tuned a VLM to look at a frame and pick the next low-level sub-policy to fetch a block.
+
+For example:
+- gripper far from the block → align across x/y
+- gripper just above the block → descend and close fingers
+
+The VLM outputs a reasoning trace (<think>) followed by a subgoal label (<action>) from a closed vocabulary.
+
+I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things:
+
+1. Format learning is fast (LoRA’s superpower)
+Getting the VLM to strictly follow the output format was the easiest win. This makes sense because this is the main usage for LoRA fine-tuning - the model has the right concepts embedded in its activations, you’re just asking it to formulate it in a certain way.
+
+2. When it comes to arithmetics, the VLM fails in unpredictable ways.
+The model could correctly calculate 2D Euclidean distances in its reasoning trace, but then confidently declare that 16 is greater than 20.
+
+3. The validation loss sometimes just shows gradients flow
+The loss function confounds three different things: token syntax (<think> tags), reasoning correctness, and final label accuracy. Watching val loss go down does not mean you're done.
+
+4. Models, like us, love shortcuts
+Looking at the confusion matrix exposed a sneaky hack:
+- align_xy reasoning often contained "I need to move over to the block first." 
+- move_to_target was the only subgoal starting with the word "move_".
+So why not misclassify align_xy as move_to_target and contradict your own calculations?
+
+As always with complex data, quantitative metrics can lie; qualitatively inspecting model traces is where real debugging happens.
+
 ## Measuring gripper-to-brick distance from a point cloud, without color or calibration
 
 The goal of the robot arm is to pick up a vertical brick. For perception, I have a depth camera that generates 3D point clouds. The goal is to guide the gripper to correctly close its fingers around the brick, and to quickly block the control policy if it plans a move that would topple the brick.

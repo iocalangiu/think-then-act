@@ -7,8 +7,9 @@ The arm lives in the **FetchPickAndPlace-v3** MuJoCo environment. The task is to
 ## 🔬 Key Engineering Insights
 For a complete breakdown of the trials, errors, and architectural insights, check out the lab notes:
 
-* **[Why text tokens are a bad action representation for continuous control](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — A breakdown of why tokenizing continuous float numbers and autoregressive order dependencies ($P(\Delta x) \cdot P(\Delta y|\Delta x)$) fail for robot arm control.
+* **[Why text tokens are a bad action representation for continuous control](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — A breakdown of why tokenizing continuous float numbers and autoregressive order dependencies (like P(Δx) · P(Δy | Δx)) fail for robot arm control.
   
+* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
 
 ---
 ## How it works
