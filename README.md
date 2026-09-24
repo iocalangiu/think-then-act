@@ -9,14 +9,15 @@ For a complete breakdown of the trials, errors, and architectural insights, chec
 
 * **[Why text tokens are a bad action representation for continuous control](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — A breakdown of why tokenizing continuous float numbers and autoregressive order dependencies (like P(Δx) · P(Δy | Δx)) fail for robot arm control.
   
-* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
+* **[Slow and fast system - not a new idea](./docs/journey.md#how-to-redesign-architecture-with-vlm-for-continuous-control)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
+* 
+* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#problems-when-fine-tuning-with-lora-a-VLM-to-pick-the-next-low-level-sub-policy)** — Hierarchical architecture (working on the low-level controller; high-level VLM)
+
+
 
 ---
 ## How it works
 
-<img width="670" height="326" alt="Screenshot 2026-07-14 at 16 33 47" src="https://github.com/user-attachments/assets/27d54f45-de89-4b1f-ad36-5344c00b4d6e" />
-
-Hierarchical architecture (working on the low-level controller; high-level VLM not yet trained). A vision-language model reads the image + text prompt and picks a subgoal (e.g. "align_xy"), passed as a one-hot into a small MLP that outputs the actual continuous action (dx, dy, dz, grip). Both parts are trained in two stages: SFT to teach format/behavior, then RL to improve it — SFT for the VLM, PPO for the MLP.
 
 The low-level MLP was first trained with GRPO, but it kept collapsing partway through training. PPO worked instead, maybe because the reward is dense?
 

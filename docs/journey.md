@@ -39,8 +39,6 @@ For example:
 
 The VLM outputs a reasoning trace (<think>) followed by a subgoal label (<action>) from a closed vocabulary.
 
-I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things:
-
 1. Format learning is fast (LoRA’s superpower)
 Getting the VLM to strictly follow the output format was the easiest win. This makes sense because this is the main usage for LoRA fine-tuning - the model has the right concepts embedded in its activations, you’re just asking it to formulate it in a certain way.
 
@@ -57,6 +55,15 @@ Looking at the confusion matrix exposed a sneaky hack:
 So why not misclassify align_xy as move_to_target and contradict your own calculations?
 
 As always with complex data, quantitative metrics can lie; qualitatively inspecting model traces is where real debugging happens.
+
+## How to redesign architecture with VLM for continuous control
+
+<img width="670" height="326" alt="Screenshot 2026-07-14 at 16 33 47" src="https://github.com/user-attachments/assets/27d54f45-de89-4b1f-ad36-5344c00b4d6e" />
+
+Hierarchical architecture (working on the low-level controller; high-level VLM not yet trained). A vision-language model reads the image + text prompt and picks a subgoal (e.g. "align_xy"), passed as a one-hot into a small MLP that outputs the actual continuous action (dx, dy, dz, grip). Both parts are trained in two stages: SFT to teach format/behavior, then RL to improve it — SFT for the VLM, PPO for the MLP.
+
+This slow and fast system architecture appears also in Physical Intelligence (pi). The High-Level "Thinker" parses complex multi-stage user prompts ("Make a sandwich, but hold the tomatoes") while the Low-Level "Actor" is more like a reactive control policy (like a fine-tuned model or a behavior-cloning policy) that takes those short sub-commands alongside camera frames and outputs the actual low-level motor controls/actions- check it out here https://www.pi.website/research/hirobot
+
 
 ## Measuring gripper-to-brick distance from a point cloud, without color or calibration
 
