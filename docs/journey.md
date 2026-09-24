@@ -2,7 +2,7 @@
 
 Notes from building this project — the dead ends and what they turned out to mean, written up as I go. 
 
-## Using Modal is amazing
+## How to train on a budget
 
 Over the past few months, I've been using Modal to build infrastructure for a robotics RL project where training and deploying models quickly outgrew local hardware. Modal fills a crucial gap when a task exceeds what you can run locally (in my case, a 2016 Mac) without standing up a full infra pipeline.
 
@@ -13,6 +13,10 @@ I also find it cool how you can choose which specific functions run remotely vs.
 Every month you get free credits which are not enough to pretrain anything from scratch, but enough to try something cool. For example, I used mine to LoRA-fine-tune a 2B-parameter Qwen2-VL model for high-level goal selection in a robot-arm RL pipeline.
 
 For the math: Modal's free Starter tier gives $30/month in credits. The A10G I trained on runs ~$1.10/hr, so that's roughly 27 hours of GPU time a month, free. Perfect for running lightweight experiments without taking on infra overhead.
+
+## How to setup Modal
+
+coming soon
 
 
 ## Why text tokens are a bad action representation for continuous control
@@ -78,3 +82,13 @@ So I switched to using the robot's own internal state via forward kinematics ins
 ![Brick and gripper points projected onto the gripper's width axis, tracked over a grasp session](../assets/journey/gripper_brick_projection.gif)
 
 The idea going forward: when the brick's points and the outer edge of the non-brick points sit at roughly the same distance along this axis, that's the gripper's fingers positioned around the brick aka sa safe regime. If the brick gets too close to those outer points, that's the regime that should trigger a quick stop. Getting there required a lot more precision than this projection alone gave — see `scripts/extract_gripper_brick_geometry.py` for where that ended up: RANSAC-based table/wall removal, PCA-based brick and finger clustering, and using the forward-kinematics prediction as a prior to pick the right point cluster as "the gripper" instead of guessing from geometry alone.
+
+## PPO vs. GRPO
+
+The low-level MLP was first trained with GRPO, but it kept collapsing partway through training. PPO worked instead, maybe because the reward is dense?
+
+<img width="341" height="180" alt="image" src="https://github.com/user-attachments/assets/5102fe5c-ab35-4b86-86fc-1335ec60abe4" />
+
+## Domain randomization
+
+coming soon

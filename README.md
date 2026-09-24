@@ -7,21 +7,28 @@ The arm lives in the **FetchPickAndPlace-v3** MuJoCo environment. The task is to
 ## 🔬 Key Engineering Insights
 For a complete breakdown of the trials, errors, and architectural insights, check out the lab notes:
 
+* **[How to train on a budget](./docs/journey.md#how-to-train-on-a-budget)** — Modal fills a crucial gap when a task exceeds what you can run locally (in my case, a 2016 Mac) without standing up a full infra pipeline.
+  
+* **[How to setup Modal](./docs/journey.md#how-to-setup-modal)** — Step-by-step how to setup modal (coming soon)
+
 * **[Why text tokens are a bad action representation for continuous control](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — A breakdown of why tokenizing continuous float numbers and autoregressive order dependencies (like P(Δx) · P(Δy | Δx)) fail for robot arm control.
   
-* **[Slow and fast system - not a new idea](./docs/journey.md#how-to-redesign-architecture-with-vlm-for-continuous-control)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
+* **[Slow and fast system - not a new idea](./docs/journey.md#how-to-redesign-architecture-with-vlm-for-continuous-control)** — Hierarchical architecture (working on the low-level controller; high-level VLM)
+  
+* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#problems-when-fine-tuning-with-lora-a-VLM-to-pick-the-next-low-level-sub-policy)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
+
+* **[PPO vs. GRPO for motor control](./docs/journey.md#ppo-vs-grpo-for-motor-control)** — Which one works when? (coming soon)
+## Measuring gripper-to-brick distance from a point cloud, without color or calibration
+
+* **[Measuring gripper-to-brick distance from a point cloud, without color or calibration](./docs/journey.md#measuring-gripper-to-brick-distance-from-a-point-cloud-,-without-color-or-calibration)** — How to process point clouds for perception.
+
+* **[Domain randomization](./docs/journey.md#domain-randomization)** — Closing the sim2real gap (coming soon)
 * 
-* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#problems-when-fine-tuning-with-lora-a-VLM-to-pick-the-next-low-level-sub-policy)** — Hierarchical architecture (working on the low-level controller; high-level VLM)
-
-
-
 ---
 ## How it works
 
 
-The low-level MLP was first trained with GRPO, but it kept collapsing partway through training. PPO worked instead, maybe because the reward is dense?
 
-<img width="341" height="180" alt="image" src="https://github.com/user-attachments/assets/5102fe5c-ab35-4b86-86fc-1335ec60abe4" />
 
 Domain randomization: The `close_gripper` low-level policy was trained with randomized block sizes (1–8cm) so it
 generalizes past one fixed cube. Below: gripping a 9cm-tall block, which is taller than anything seen
