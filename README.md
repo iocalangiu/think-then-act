@@ -4,7 +4,11 @@ Training a robot arm to plan a sequence of actions using images of the environme
 
 The arm lives in the **FetchPickAndPlace-v3** MuJoCo environment. The task is to pick up a block and move it to a target location.
 
-See [`docs/journey.md`](docs/journey.md) for the dead ends along the way — why text-token actions don't work for continuous control, and how gripper-to-brick distance gets measured from a raw point cloud.
+## 🔬 Key Engineering Insights
+For a complete breakdown of the trials, errors, and architectural insights, check out the lab notes:
+
+* **[Why text tokens are a bad action representation for continuous control](./docs/journey.md#why-text-tokens-are-a-bad-action-representation-for-continuous-control)** — A breakdown of why tokenizing continuous float numbers and autoregressive order dependencies ($P(\Delta x) \cdot P(\Delta y|\Delta x)$) fail for robot arm control.
+  
 
 ---
 ## How it works
