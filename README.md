@@ -23,20 +23,9 @@ For a complete breakdown of the trials, errors, and architectural insights, chec
 * **[Measuring gripper-to-brick distance from a point cloud, without color or calibration](./docs/journey.md#measuring-gripper-to-brick-distance-from-a-point-cloud-,-without-color-or-calibration)** — How to process point clouds for perception.
 
 * **[Domain randomization](./docs/journey.md#domain-randomization)** — Closing the sim2real gap (coming soon)
-* 
----
-## How it works
+  
+* **[RL infrastructure](./docs/journey.md#rl-infrastructure)** — What can the system do during rollouts (coming soon)
 
-
-
-
-Domain randomization: The `close_gripper` low-level policy was trained with randomized block sizes (1–8cm) so it
-generalizes past one fixed cube. Below: gripping a 9cm-tall block, which is taller than anything seen
-during training.
-
-![block-size generalization demo](assets/generalization_demo.gif)
-
-Rollouts are run across 8 CPUs (8 MuJoCo episodes at once to collect data), then pause them while 1 core does the quick PPO update step, then repeat. PPO update step takes a split second, so it makes no sense to start rolling out in parallel.
 
 ---
 
