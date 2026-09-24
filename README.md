@@ -18,7 +18,6 @@ For a complete breakdown of the trials, errors, and architectural insights, chec
 * **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#problems-when-fine-tuning-with-lora-a-VLM-to-pick-the-next-low-level-sub-policy)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
 
 * **[PPO vs. GRPO for motor control](./docs/journey.md#ppo-vs-grpo-for-motor-control)** — Which one works when? (coming soon)
-## Measuring gripper-to-brick distance from a point cloud, without color or calibration
 
 * **[Measuring gripper-to-brick distance from a point cloud, without color or calibration](./docs/journey.md#measuring-gripper-to-brick-distance-from-a-point-cloud-,-without-color-or-calibration)** — How to process point clouds for perception.
 
