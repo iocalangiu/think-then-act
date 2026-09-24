@@ -69,7 +69,7 @@ Hierarchical architecture (working on the low-level controller; high-level VLM n
 This slow and fast system architecture appears also in Physical Intelligence (pi). The High-Level "Thinker" parses complex multi-stage user prompts ("Make a sandwich, but hold the tomatoes") while the Low-Level "Actor" is more like a reactive control policy (like a fine-tuned model or a behavior-cloning policy) that takes those short sub-commands alongside camera frames and outputs the actual low-level motor controls/actions- check it out here https://www.pi.website/research/hirobot
 
 
-## Measuring gripper-to-brick distance from a point cloud, without color or calibration
+## Measuring gripper to brick distance from a point cloud without color or calibration
 
 The goal of the robot arm is to pick up a vertical brick. For perception, I have a depth camera that generates 3D point clouds. The goal is to guide the gripper to correctly close its fingers around the brick, and to quickly block the control policy if it plans a move that would topple the brick.
 
@@ -83,7 +83,7 @@ So I switched to using the robot's own internal state via forward kinematics ins
 
 The idea going forward: when the brick's points and the outer edge of the non-brick points sit at roughly the same distance along this axis, that's the gripper's fingers positioned around the brick aka sa safe regime. If the brick gets too close to those outer points, that's the regime that should trigger a quick stop. Getting there required a lot more precision than this projection alone gave — see `scripts/extract_gripper_brick_geometry.py` for where that ended up: RANSAC-based table/wall removal, PCA-based brick and finger clustering, and using the forward-kinematics prediction as a prior to pick the right point cluster as "the gripper" instead of guessing from geometry alone.
 
-## PPO vs. GRPO
+## PPO vs GRPO for motor control
 
 The low-level MLP was first trained with GRPO, but it kept collapsing partway through training. PPO worked instead, maybe because the reward is dense?
 
@@ -98,7 +98,7 @@ Domain randomization: The `close_gripper` low-level policy was trained with rand
 generalizes past one fixed cube. Below: gripping a 9cm-tall block, which is taller than anything seen
 during training.
 
-![block-size generalization demo](assets/generalization_demo.gif)
+![block-size generalization demo](../assets/generalization_demo.gif)
 
 ## RL infrastructure
 

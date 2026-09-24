@@ -15,17 +15,15 @@ For a complete breakdown of the trials, errors, and architectural insights, chec
   
 * **[Slow and fast system - not a new idea](./docs/journey.md#how-to-redesign-architecture-with-vlm-for-continuous-control)** — Hierarchical architecture (working on the low-level controller; high-level VLM)
   
-* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#problems-when-fine-tuning-with-lora-a-VLM-to-pick-the-next-low-level-sub-policy)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
+* **[Problems when fine-tuning with LoRA a VLM to pick the next-low level sub-policy](./docs/journey.md#problems-when-fine-tuning-with-lora-a-vlm-to-pick-the-next-low-level-sub-policy)** — I fine-tuned with LoRA (updating Q/K/V/O attention modules) and learned at least 4 things
 
 * **[PPO vs. GRPO for motor control](./docs/journey.md#ppo-vs-grpo-for-motor-control)** — Which one works when? (coming soon)
 
-* **[Measuring gripper-to-brick distance from a point cloud, without color or calibration](./docs/journey.md#measuring-gripper-to-brick-distance-from-a-point-cloud-,-without-color-or-calibration)** — How to process point clouds for perception.
+* **[Measuring gripper-to-brick distance from a point cloud, without color or calibration](./docs/journey.md#measuring-gripper-to-brick-distance-from-a-point-cloud--without-color-or-calibration)** — How to process point clouds for perception.
 
 * **[Domain randomization](./docs/journey.md#domain-randomization)** — Closing the sim2real gap (coming soon)
   
 * **[RL infrastructure](./docs/journey.md#rl-infrastructure)** — What can the system do during rollouts (coming soon)
-
-
 ---
 
 ## Stack
