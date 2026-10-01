@@ -31,6 +31,12 @@ Run with:
     modal run --detach scripts/train_low_level_ppo.py --subgoals close_gripper,lift,move_to_target,release
                                                               # skip subgoals already
                                                               # finished in an earlier run
+    modal run --detach scripts/train_low_level_ppo.py --subgoals align_xy --no-use-pose-model --pos-noise-std 0.005
+                                                              # train/eval against ground-truth
+                                                              # achieved_goal + generic per-step
+                                                              # position noise instead of
+                                                              # block_pose_predictor.pt — see
+                                                              # use_pose_model/pos_noise_std params
 
 Early stopping: a subgoal stops (and moves to the next) once completion_rate
 holds >= --early-stop-threshold (default 1.0) for --early-stop-patience
@@ -77,6 +83,38 @@ def train_low_level_ppo(
     early_stop_patience: int = 2,     # consecutive eval checkpoints at/above threshold
                                       # before stopping early; 0 disables early stopping
     early_stop_threshold: float = 1.0,
+    randomize_block_size: bool = False,   # opt-in — see env/setup.py's init_random_episode
+                                           # docstring. Applies to every subgoal in this run;
+                                           # only close_gripper's own reward/observation
+                                           # actually reads the sampled size today (the other
+                                           # 5 subgoals' reward math is either size-agnostic
+                                           # or already gets a per-episode block_half_height/
+                                           # block_width via compute_subgoal_reward).
+    warm_start_ckpt: str = "",   # optional path (under MODEL_CACHE_DIR/checkpoints)
+                                  # to load actor/critic weights from before training
+                                  # starts — unlike --resume, this does NOT affect
+                                  # start_iteration (training runs the FULL curriculum
+                                  # from iteration 0 with these as the initial weights,
+                                  # not "pick up counting where a prior run left off").
+                                  # For continuing an already-good checkpoint (e.g. one
+                                  # that mastered touch-once) into a NEW, harder
+                                  # curriculum (e.g. requiring a multi-step hold) without
+                                  # re-learning the base skill from scratch.
+    use_pose_model: bool = True,   # False: never wire block_pose_predictor.pt into any
+                                  # subgoal's observation this run, even if the checkpoint
+                                  # exists on the volume — use ground-truth achieved_goal
+                                  # (optionally + pos_noise_std) instead. Added 2026-09-03:
+                                  # the pose model predates block-size randomization and
+                                  # localizes small blocks badly (hierarchical_architecture
+                                  # memory, 2026-08-19/20), which was confounding align_xy's
+                                  # own precision tuning — this opts a run out of that
+                                  # confound entirely, matching the real robot's current
+                                  # fixed-known-target deployment (no CNN in that loop).
+    pos_noise_std: float = 0.0,   # metres — generic per-step Gaussian noise stand-in for
+                                  # pose-estimation error (see SubgoalConditionedEnv's own
+                                  # param doc), applied ONLY when use_pose_model is False
+                                  # (or no pose checkpoint exists). 0.0 = ground truth,
+                                  # unperturbed.
 ) -> dict:
     import os
     import glob
@@ -97,7 +135,7 @@ def train_low_level_ppo(
     from think_then_act.policy.subgoal_policy import SubgoalGaussianPolicy
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
-    from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
     from think_then_act.training.low_level_ppo import LowLevelPPOConfig, LowLevelPPOTrainer
 
     print("\n" + "=" * 60)
@@ -133,7 +171,12 @@ def train_low_level_ppo(
     # processes as collision_ckpt above.
     # ------------------------------------------------------------------
     pose_ckpt = os.path.join(MODEL_CACHE_DIR, "checkpoints", "block_pose_predictor.pt")
-    if os.path.exists(pose_ckpt):
+    if not use_pose_model:
+        pose_ckpt = None
+        print(f"  --use-pose-model=False — every subgoal will train with ground-truth "
+              f"achieved_goal" + (f" + pos_noise_std={pos_noise_std}" if pos_noise_std > 0 else "")
+              + " as its observation input, regardless of any pose checkpoint on the volume.")
+    elif os.path.exists(pose_ckpt):
         print(f"  Block pose predictor checkpoint found <- {pose_ckpt}")
     else:
         pose_ckpt = None
@@ -210,15 +253,85 @@ def train_low_level_ppo(
         return SubgoalConditionedEnv(
             base, subgoal=subgoal, collision_model=collision_model,
             pose_model=pose_model, align_xy_policy=align_xy_policy,
-            max_episode_steps=max_episode_steps,
+            max_episode_steps=max_episode_steps, randomize_block_size=randomize_block_size,
+            pos_noise_std=pos_noise_std,
         )
+
+    # Curriculum for block-size randomization: start narrow (near the
+    # original fixed cube), widen toward the full [0.01, 0.08] range over
+    # training. Motivated by a MEASURED finding, not a guess
+    # (scripts/debug_random_exploration_grip_force.py, 2026-08-13): purely
+    # random exploration finds real grip force in 33% of episodes against
+    # the fixed 5cm cube, but only 7% against the full randomized range —
+    # PPO loses most of its early "accidental success" anchor the moment
+    # size varies over the full range from iteration 0. Starting narrow
+    # restores that anchor, then widens once gripping itself is established.
+    # Deliberately simple (3 equal-length, iteration-count-based stages, not
+    # completion-rate-gated) for this first pass — a no-op when
+    # randomize_block_size is off. eval_env (below) deliberately stays on
+    # the FULL range throughout, not the current stage's narrowed one, so
+    # completion_rate/early-stopping always measure progress on the REAL
+    # target distribution, never "mastered the easy stage" — early stopping
+    # can only fire once the full-range eval is genuinely good, so it can't
+    # prematurely end a run still in an early, narrow curriculum stage.
+    SIZE_CURRICULUM_STAGES = [
+        (0.0,     (0.04, 0.06)),   # stage 1: narrow, near the original cube
+        (1 / 3.0, (0.025, 0.07)),  # stage 2: medium
+        (2 / 3.0, None),           # stage 3: full range (block_randomization.py default)
+    ]
+
+    def size_range_for_iteration(i: int):
+        if not randomize_block_size:
+            return None
+        progress = i / max(n_iterations, 1)
+        current = SIZE_CURRICULUM_STAGES[0][1]
+        for start_frac, stage_range in SIZE_CURRICULUM_STAGES:
+            if progress >= start_frac:
+                current = stage_range
+        return current
+
+    # Companion curriculum for close_gripper_done_streak (see
+    # SubgoalConditionedEnv's own docstring for why this exists — a single-
+    # step contact-force spike satisfying done doesn't mean a real, stable
+    # grasp). Found 2026-08-13: jumping straight to requiring a 3-step hold
+    # from iteration 0 broke training completely (closedness pinned at
+    # 0.0000 for 200+ iterations, same saturation signature as before the
+    # mean-init fix) — because touching the block once used to end the
+    # episode in success immediately, before any drift could happen; once
+    # that same touch no longer ends the episode, an untrained policy
+    # drifts on the very next step or two, and what used to be a clean
+    # success now reads as a drifted_too_far FAILURE instead. "Touch and
+    # hold for 3 steps" turned out to be a much rarer accidental event than
+    # "touch once," removing the same early positive-reward anchor
+    # size-curriculum was built to preserve. Ramping the streak requirement
+    # alongside size gives the policy time to keep the "touch" skill it
+    # already has (stage 1 matches the ORIGINAL single-instant done it was
+    # already trained against) before also demanding it hold longer.
+    # eval_env stays at the full streak=3 requirement throughout, same
+    # reasoning as size: completion_rate/early-stopping must always reflect
+    # the REAL target robustness bar, not an eased one.
+    DONE_STREAK_CURRICULUM_STAGES = [
+        (0.0,     1),   # stage 1: single touch — matches the skill already trained
+        (1 / 3.0, 2),
+        (2 / 3.0, 3),   # stage 3: full robustness bar
+    ]
+
+    def done_streak_for_iteration(i: int) -> int:
+        if not randomize_block_size:
+            return 3   # SubgoalConditionedEnv's own default, unchanged
+        progress = i / max(n_iterations, 1)
+        current = DONE_STREAK_CURRICULUM_STAGES[0][1]
+        for start_frac, stage_streak in DONE_STREAK_CURRICULUM_STAGES:
+            if progress >= start_frac:
+                current = stage_streak
+        return current
 
     results = {}
 
     for subgoal in subgoal_list:
         print(f"\n--- Training subgoal: {subgoal} (PPO) ---")
 
-        config_kwargs = dict(obs_dim=SUBGOAL_OBS_DIM, max_episode_steps=max_episode_steps,
+        config_kwargs = dict(obs_dim=obs_dim_for_subgoal(subgoal), max_episode_steps=max_episode_steps,
                               n_workers=n_workers)
         if n_rollouts > 0:
             config_kwargs["n_rollouts"] = n_rollouts
@@ -239,9 +352,16 @@ def train_low_level_ppo(
         config = LowLevelPPOConfig(**config_kwargs)
         trainer = LowLevelPPOTrainer(config)
 
+        if warm_start_ckpt:
+            warm_start_path = os.path.join(MODEL_CACHE_DIR, "checkpoints", warm_start_ckpt)
+            trainer.load_checkpoint(warm_start_path)   # let this raise on architecture mismatch
+            print(f"  [warm-start] {subgoal}: loaded initial weights from {warm_start_path} "
+                  f"(training still starts counting at iteration 0)")
+
         env_kwargs = dict(subgoal=subgoal, max_episode_steps=max_episode_steps,
                            collision_ckpt=collision_ckpt, pose_ckpt=pose_ckpt,
-                           align_xy_ckpt=align_xy_ckpt)
+                           align_xy_ckpt=align_xy_ckpt, randomize_block_size=randomize_block_size,
+                           pos_noise_std=pos_noise_std)
 
         # Eval uses its own plain (non-pooled) env — 10 episodes is cheap
         # sequentially, no need to spin up the worker pool for it.
@@ -259,7 +379,7 @@ def train_low_level_ppo(
         # file's align_xy_ckpt resolution comment.
         eval_align_xy_policy = None
         if align_xy_ckpt is not None and subgoal == "descend":
-            eval_align_xy_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+            eval_align_xy_policy = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal("align_xy"))
             align_xy_ckpt_data = torch.load(align_xy_ckpt, map_location="cpu")
             eval_align_xy_policy.load_state_dict(
                 align_xy_ckpt_data["actor"] if isinstance(align_xy_ckpt_data, dict) and "actor" in align_xy_ckpt_data
@@ -309,13 +429,27 @@ def train_low_level_ppo(
         # this logic — this fix closes the actual hole, not just the symptom.
         best_completion_rate = -1.0
         if os.path.exists(best_ckpt_path):
-            probe_actor = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
-            probe_ckpt = torch.load(best_ckpt_path, map_location="cpu")
-            probe_actor.load_state_dict(probe_ckpt["actor"] if isinstance(probe_ckpt, dict) and "actor" in probe_ckpt else probe_ckpt)
-            probe_actor.eval()
-            best_completion_rate = run_eval(probe_actor)
-            print(f"  [resume] {subgoal}: existing best checkpoint completion_rate={best_completion_rate:.1%} "
-                  f"(seeded from {best_ckpt_path})")
+            # Runs UNCONDITIONALLY (not gated behind --resume) whenever a
+            # _best.pt already exists — so an obs_dim change (e.g.
+            # close_gripper picking up block_dims, 2026-08-10) makes any
+            # PRE-EXISTING best checkpoint architecturally incompatible with
+            # the freshly-constructed probe_actor. Caught the same way
+            # find_resume_checkpoint already handles this (RuntimeError on
+            # load_state_dict shape mismatch) rather than crashing the run
+            # before it even starts collecting rollouts — falls back to
+            # -1.0 (don't seed, a fresh best.pt will simply get overwritten
+            # on this run's first real improvement).
+            try:
+                probe_actor = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal(subgoal))
+                probe_ckpt = torch.load(best_ckpt_path, map_location="cpu")
+                probe_actor.load_state_dict(probe_ckpt["actor"] if isinstance(probe_ckpt, dict) and "actor" in probe_ckpt else probe_ckpt)
+                probe_actor.eval()
+                best_completion_rate = run_eval(probe_actor)
+                print(f"  [resume] {subgoal}: existing best checkpoint completion_rate={best_completion_rate:.1%} "
+                      f"(seeded from {best_ckpt_path})")
+            except RuntimeError as e:
+                print(f"  [resume] {subgoal}: existing {best_ckpt_path} incompatible with the "
+                      f"current actor architecture ({e}) — not seeding, starting from -1.0.")
 
         def maybe_save_best(completion_rate: float) -> None:
             nonlocal best_completion_rate
@@ -348,6 +482,14 @@ def train_low_level_ppo(
             consecutive_at_threshold = 0
             stopped_early_at = None
             for i in range(start_iteration, n_iterations):
+                new_size_range = size_range_for_iteration(i)
+                new_done_streak = done_streak_for_iteration(i)
+                if (new_size_range != env_kwargs.get("size_range")
+                        or new_done_streak != env_kwargs.get("done_streak")):
+                    env_kwargs = dict(env_kwargs, size_range=new_size_range, done_streak=new_done_streak)
+                    print(f"  [curriculum] {subgoal}: size_range -> "
+                          f"{new_size_range or 'full [0.01, 0.08]'}  done_streak -> {new_done_streak} "
+                          f"at iter {i}")
                 metrics = trainer.train_iteration(env_kwargs, i)
                 history.append(metrics)
 
@@ -454,6 +596,10 @@ def main(
     minibatch_size: int = 0,
     early_stop_patience: int = 2,
     early_stop_threshold: float = 1.0,
+    randomize_block_size: bool = False,
+    warm_start_ckpt: str = "",
+    use_pose_model: bool = True,
+    pos_noise_std: float = 0.0,
 ):
     print(f"\nDispatching PPO+GAE low-level controller training to Modal (CPU)...")
     print(f"  subgoals={subgoals}  n_iterations={n_iterations}  max_episode_steps={max_episode_steps}  "
@@ -464,13 +610,17 @@ def main(
           f"lr={lr or 'default'}  entropy_coef={'default' if entropy_coef < 0 else entropy_coef}  "
           f"clip_eps={clip_eps or 'default'}  n_epochs={n_epochs or 'default'}  "
           f"minibatch_size={minibatch_size or 'default'}  "
-          f"early_stop_patience={early_stop_patience}  early_stop_threshold={early_stop_threshold:.0%}\n")
+          f"early_stop_patience={early_stop_patience}  early_stop_threshold={early_stop_threshold:.0%}  "
+          f"randomize_block_size={randomize_block_size}  warm_start_ckpt={warm_start_ckpt or 'none'}  "
+          f"use_pose_model={use_pose_model}  pos_noise_std={pos_noise_std}\n")
     handle = train_low_level_ppo.spawn(
         subgoals=subgoals, n_iterations=n_iterations, max_episode_steps=max_episode_steps,
         resume=resume, resume_ckpt_iter=resume_ckpt_iter,
         n_rollouts=n_rollouts, n_workers=n_workers, gamma=gamma, gae_lambda=gae_lambda,
         lr=lr, entropy_coef=entropy_coef, clip_eps=clip_eps, n_epochs=n_epochs, minibatch_size=minibatch_size,
         early_stop_patience=early_stop_patience, early_stop_threshold=early_stop_threshold,
+        randomize_block_size=randomize_block_size, warm_start_ckpt=warm_start_ckpt,
+        use_pose_model=use_pose_model, pos_noise_std=pos_noise_std,
     )
     print(f"Job spawned. Function call ID: {handle.object_id}")
     print(f"Monitor at https://modal.com")
