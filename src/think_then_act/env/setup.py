@@ -109,12 +109,69 @@ def has_contact(env, body_substring: str = None) -> bool:
     return any(needle in n1.lower() or needle in n2.lower() for n1, n2 in pairs)
 
 
+BLOCK_BODY_NAME  = "object0"
+_LEFT_FINGER_BODY  = "robot0:l_gripper_finger_link"
+_RIGHT_FINGER_BODY = "robot0:r_gripper_finger_link"
+
+
+def grip_contact_forces(env) -> dict:
+    """
+    Normal-force magnitude (mujoco.mj_contactForce) between EACH gripper
+    finger and the block, read directly from the physics contact solver —
+    "is this finger actually pressing on the block," in Newtons, not
+    inferred from finger-joint position (total_finger_width). Unlike a
+    target-finger-width proxy, this needs no per-block-size calibration:
+    contact force between two solids is a property of the contact itself,
+    not of how wide the object is — see reward/subgoal_reward.py's
+    reward_close_gripper, which uses this instead of the old width-based
+    Gaussian (close_gripper_target_width) specifically so the reward
+    generalizes to blocks of any size/shape, not just the one 5cm cube it
+    was originally calibrated against.
+
+    Same per-step data.contact iteration as get_contact_geoms, but that
+    function only returns body-NAME pairs, not force — needed separately
+    here rather than extending get_contact_geoms's return shape, since no
+    other caller of get_contact_geoms wants per-contact force.
+
+    Returns {"left": float, "right": float} — the LARGEST normal force
+    across all contacts touching each finger this step (0.0 if that finger
+    has no contact with the block at all). Kept PER-FINGER, not summed, so
+    callers can require BOTH sides engaged (min(left, right) > 0) rather
+    than let one finger pressing hard while the other floats free count as
+    a grip.
+    """
+    import mujoco
+    raw = env.unwrapped
+    forces = {"left": 0.0, "right": 0.0}
+    finger_side = {_LEFT_FINGER_BODY: "left", _RIGHT_FINGER_BODY: "right"}
+
+    for i in range(raw.data.ncon):
+        c = raw.data.contact[i]
+        body1 = mujoco.mj_id2name(raw.model, mujoco.mjtObj.mjOBJ_BODY, raw.model.geom_bodyid[c.geom1]) or ""
+        body2 = mujoco.mj_id2name(raw.model, mujoco.mjtObj.mjOBJ_BODY, raw.model.geom_bodyid[c.geom2]) or ""
+        pair = {body1, body2}
+        if BLOCK_BODY_NAME not in pair:
+            continue
+        finger_body = next((b for b in pair if b in finger_side), None)
+        if finger_body is None:
+            continue
+
+        result = np.zeros(6, dtype=np.float64)
+        mujoco.mj_contactForce(raw.model, raw.data, i, result)
+        side = finger_side[finger_body]
+        forces[side] = max(forces[side], abs(float(result[0])))  # result[0] = contact-normal force
+
+    return forces
+
+
 # The table's body name in FetchPickAndPlace-v3's MJCF — explicitly declared
 # and stable (unlike its geom, which has no name — see get_contact_geoms's
 # docstring). Confirmed via validate_collision_labels.py's full geom
 # enumeration (2026-07-12): body=table0, xpos=[1.30,0.75,0.20],
 # size=[0.25,0.35,0.2] -> real table top z = 0.20+0.2 = 0.400.
 TABLE_BODY_NAME = "table0"
+TABLE_TOP_Z     = 0.400  # metres — the physical table surface, unlike a block's
+                          # resting-CENTER height this never changes with block size.
 
 # Contacts that are benign, i.e. NOT the failure mode this predictor should
 # flag:
@@ -248,16 +305,60 @@ def get_meaningful_table_collision_positions(env, table_body: str = TABLE_BODY_N
     return positions
 
 
-def init_random_episode(env, rng) -> tuple:
+def init_random_episode(env, rng, randomize_block_size: bool = False, size_range: tuple = None,
+                         width_range: tuple = None, length_range: tuple = None,
+                         height_range: tuple = None) -> tuple:
     """
     Randomise block and target on the table disk (centre [1.30, 0.75], r=0.20m).
     Call after env.reset(). Returns (obs, ok).
     Same rng seed across rollouts in a group → same positions, different actions.
+
+    randomize_block_size: if True, also samples a new width/length/height for
+    the block (env.block_randomization.sample_and_apply_block_size) BEFORE
+    teleporting it, and spawns/targets at TABLE_TOP_Z + this episode's own
+    half-height instead of the old hardcoded 0.425 (only correct for the one
+    fixed 5cm cube every subgoal was trained against before). Defaults to
+    False so every EXISTING caller (every subgoal's own training/eval/record
+    script) stays byte-for-byte unaffected — same False-means-unchanged
+    convention as randomize_gripper on init_episode_before_subgoal. Only
+    close_gripper's retrain opts in for now (see hierarchical_architecture
+    memory, Stage 4): align_xy/descend/move_to_target's reward math only
+    ever reads the block's CENTER position, not its size, so there's no
+    forcing function to change their training distribution yet — extending
+    size randomization to them is a separate, later decision.
+
+    size_range: optional (min, max) tuple applied to ALL THREE dims (width/
+    length/height alike), overriding block_randomization.py's own default
+    per-axis ranges — used for curriculum training (start narrow, e.g.
+    (0.04, 0.06), widen toward the full (0.01, 0.08) range as training
+    progresses). None (default) uses block_randomization.py's own module-
+    level defaults, unchanged. Ignored when randomize_block_size is False.
+
+    width_range/length_range/height_range: optional PER-AXIS overrides, each
+    taking precedence over size_range for that one axis when given — e.g.
+    width_range=(0.05,0.05), height_range=(0.07,0.07) pins a non-cube shape
+    (width/length stay whatever size_range/defaults say) for a demo/eval
+    recording, without needing a uniform cube. None (default, for all
+    three) leaves size_range's shared-range behavior unchanged.
     """
     import mujoco
     raw = env.unwrapped
 
     table_cx, table_cy, r_max = 1.30, 0.75, 0.20
+    resting_z = 0.425
+    if randomize_block_size:
+        from think_then_act.env.block_randomization import sample_and_apply_block_size
+        range_kwargs = {}
+        if size_range is not None:
+            range_kwargs = dict(width_range=size_range, length_range=size_range, height_range=size_range)
+        if width_range is not None:
+            range_kwargs["width_range"] = width_range
+        if length_range is not None:
+            range_kwargs["length_range"] = length_range
+        if height_range is not None:
+            range_kwargs["height_range"] = height_range
+        dims = sample_and_apply_block_size(raw.model, rng, **range_kwargs)
+        resting_z = TABLE_TOP_Z + dims["height"] / 2.0
 
     def sample_disk():
         r     = np.sqrt(rng.uniform(0.0, 1.0)) * r_max
@@ -271,8 +372,8 @@ def init_random_episode(env, rng) -> tuple:
         if np.linalg.norm(target_xy - block_xy) > 0.10:
             break
 
-    teleport_block(env, np.array([block_xy[0], block_xy[1], 0.425]))
-    raw.goal = np.array([target_xy[0], target_xy[1], 0.425])
+    teleport_block(env, np.array([block_xy[0], block_xy[1], resting_z]))
+    raw.goal = np.array([target_xy[0], target_xy[1], resting_z])
 
     for fname in ("robot0:r_gripper_finger_joint", "robot0:l_gripper_finger_joint"):
         fid = mujoco.mj_name2id(raw.model, mujoco.mjtObj.mjOBJ_JOINT, fname)
@@ -284,7 +385,7 @@ def init_random_episode(env, rng) -> tuple:
 
 
 def _subgoal_setup_reached(subgoal: str, obs_arr, achieved_goal, desired_goal,
-                            carrying: bool) -> bool:
+                            carrying: bool, block_resting_z: float = 0.425) -> bool:
     """
     Pure predicate: has the scripted oracle (env.oracle.oracle_action)
     reached the state that should hand off to `subgoal`'s own policy?
@@ -301,6 +402,11 @@ def _subgoal_setup_reached(subgoal: str, obs_arr, achieved_goal, desired_goal,
     start). align_xy/descend need no setup — a fresh reset already IS
     their correct starting state — so this is only ever called for the
     other four.
+
+    block_resting_z: same per-episode resting-CENTER height as
+    oracle_action's own parameter (defaults to 0.425, the original fixed
+    cube) — the lift/move_to_target branches below compare against it
+    directly, same fix and same reason (2026-08-10).
     """
     finger_width = float(np.sum(obs_arr[9:11]))
     block_z = float(achieved_goal[2])
@@ -342,10 +448,10 @@ def _subgoal_setup_reached(subgoal: str, obs_arr, achieved_goal, desired_goal,
     if subgoal == "lift":
         # Fingers closed around the block, still resting at table height —
         # close_gripper's job is done, lift's hasn't started yet.
-        return finger_width <= 0.07 and block_z <= 0.45
+        return finger_width <= 0.07 and block_z <= block_resting_z + 0.025
     if subgoal == "move_to_target":
         # Just lifted, oracle entering CARRY — block off the table, held.
-        return carrying and block_z > 0.45
+        return carrying and block_z > block_resting_z + 0.025
     if subgoal == "release":
         # Carried to (near) the target — move_to_target's job is done.
         return carrying and d_block_target <= 0.05
@@ -408,7 +514,10 @@ def _run_align_xy_until_done(env, obs, align_xy_policy, max_steps: int) -> tuple
 
 
 def init_episode_before_subgoal(env, rng, subgoal: str, max_setup_steps: int = 200,
-                                 randomize_gripper: bool = False, align_xy_policy=None) -> tuple:
+                                 randomize_gripper: bool = False, align_xy_policy=None,
+                                 randomize_block_size: bool = False, size_range: tuple = None,
+                                 width_range: tuple = None, length_range: tuple = None,
+                                 height_range: tuple = None) -> tuple:
     """
     Constructs a starting state appropriate for training `subgoal` in
     isolation, instead of always the same fresh/ungrasped reset
@@ -445,6 +554,11 @@ def init_episode_before_subgoal(env, rng, subgoal: str, max_setup_steps: int = 2
     but never the gripper, so the high-level VLM was seeing an identical
     gripper number on a meaningful fraction of its align_xy training data.
 
+    randomize_block_size/size_range/width_range/length_range/height_range:
+    forwarded as-is to init_random_episode — see that function's own
+    docstring. All default to their unaffected values (False/None), same
+    convention as randomize_gripper.
+
     Returns (obs, ok) — ok is False if either init_random_episode's own
     reset failed, the (opt-in) gripper repositioning failed, or the
     oracle/align_xy_policy didn't reach the target state within
@@ -458,7 +572,8 @@ def init_episode_before_subgoal(env, rng, subgoal: str, max_setup_steps: int = 2
     """
     from think_then_act.env.oracle import oracle_action
 
-    obs, ok = init_random_episode(env, rng)
+    obs, ok = init_random_episode(env, rng, randomize_block_size=randomize_block_size, size_range=size_range,
+                                   width_range=width_range, length_range=length_range, height_range=height_range)
     if not ok:
         return obs, False
 
@@ -475,12 +590,23 @@ def init_episode_before_subgoal(env, rng, subgoal: str, max_setup_steps: int = 2
             return obs, True
         return _run_align_xy_until_done(env, obs, align_xy_policy, max_setup_steps)
 
+    # Reads back whatever init_random_episode (above) already sampled/spawned
+    # this episode — get_block_dims falls back to the ORIGINAL fixed-cube
+    # geometry when block-size randomization wasn't enabled, so this
+    # computes exactly 0.425 (the old hardcoded default) in that case, byte-
+    # identical to before. Only actually differs once randomize_block_size
+    # varies the block's height.
+    from think_then_act.env.block_randomization import get_block_dims
+    resting_z = TABLE_TOP_Z + get_block_dims(env.unwrapped.model)["height"] / 2.0
+
     carrying = False
     for _ in range(max_setup_steps):
         obs_arr, achieved, desired = obs["observation"], obs["achieved_goal"], obs["desired_goal"]
-        action, _phase, carrying = oracle_action(obs_arr, achieved, desired, carrying)
+        action, _phase, carrying = oracle_action(obs_arr, achieved, desired, carrying,
+                                                  block_resting_z=resting_z)
 
-        if _subgoal_setup_reached(subgoal, obs_arr, achieved, desired, carrying):
+        if _subgoal_setup_reached(subgoal, obs_arr, achieved, desired, carrying,
+                                   block_resting_z=resting_z):
             return obs, True
 
         obs, _, terminated, truncated, _ = env.step(action)
@@ -492,7 +618,7 @@ def init_episode_before_subgoal(env, rng, subgoal: str, max_setup_steps: int = 2
 
 def randomize_gripper_start(
     env, rng, obs, margin: float = 0.15, n_position_steps: int = 40,
-    xy_bias_strength: float = 0.9, theta: float = None,
+    xy_bias_strength: float = 0.9, theta: float = None, target_xy=None,
 ) -> tuple:
     """
     Drive the gripper toward a random point around the table's perimeter,
@@ -505,6 +631,18 @@ def randomize_gripper_start(
     theta: angle around the table in radians (0=+x/"east", pi/2=+y/"north",
     etc.). If None (default), drawn uniformly from rng — pass an explicit
     value to test a specific side deterministically.
+
+    target_xy: an explicit (x, y) to drive toward instead of a
+    perimeter/theta point — e.g. the block's own achieved_goal[:2], to put
+    the gripper laterally above the block while z stays at whatever height
+    it already was (still a real lateral drive through the bounded action
+    interface, not a teleport — same reasoning as below). Added 2026-09-18
+    to build a genuine "aligned but still elevated" starting frame for a
+    demo (see scripts/record_subgoal_demo.py) — align_xy's own trained
+    policy can't produce that state itself, since its reward already pulls
+    dz down as a side effect of reaching its xy objective (see
+    hierarchical_architecture memory). None (default) preserves the
+    original perimeter/theta behavior byte-for-byte.
 
     Why this exists (2026-07-13): without it, every episode starts from the
     same fixed default arm pose regardless of seed — only the block's
@@ -540,10 +678,13 @@ def randomize_gripper_start(
     table_geom_ids = [g for g in range(raw.model.ngeom) if raw.model.geom_bodyid[g] == table_body_id]
     half_extent = raw.model.geom_size[table_geom_ids[0]][:2].copy()
 
-    if theta is None:
-        theta = rng.uniform(0.0, 2.0 * np.pi)
-    radius_xy = half_extent + margin
-    start_xy = table_xy + radius_xy * np.array([np.cos(theta), np.sin(theta)])
+    if target_xy is not None:
+        start_xy = np.asarray(target_xy, dtype=np.float64)
+    else:
+        if theta is None:
+            theta = rng.uniform(0.0, 2.0 * np.pi)
+        radius_xy = half_extent + margin
+        start_xy = table_xy + radius_xy * np.array([np.cos(theta), np.sin(theta)])
 
     done, trunc = False, False
     for _ in range(n_position_steps):
@@ -558,5 +699,9 @@ def randomize_gripper_start(
             break
 
     actual_xy = np.array(obs["observation"][0:2])
-    info = {"theta": float(theta), "intended_start_xy": start_xy.copy(), "actual_start_xy": actual_xy}
+    info = {
+        "theta": float(theta) if theta is not None else None,
+        "intended_start_xy": start_xy.copy(),
+        "actual_start_xy": actual_xy,
+    }
     return obs, not (done or trunc), info

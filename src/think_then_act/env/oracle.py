@@ -19,14 +19,28 @@ from __future__ import annotations
 import numpy as np
 
 
-def oracle_action(obs_arr, achieved_goal, desired_goal, carrying: bool = False):
+def oracle_action(obs_arr, achieved_goal, desired_goal, carrying: bool = False,
+                   block_resting_z: float = 0.425):
     """
     Scripted heuristic for FetchPickAndPlace. Returns (action, phase, carrying).
 
     `carrying` is stateful hysteresis: once the block is grasped and lifted, stay
     in CARRY until the block clearly escapes the gripper (d_3d > 0.12).  Without
     this, CARRY moves toward the target (which is at table height), descending the
-    block below the block_z > 0.45 threshold and causing GRASP/CARRY oscillation.
+    block below the block_lifted threshold and causing GRASP/CARRY oscillation.
+
+    block_resting_z: the block's own resting-CENTER height for THIS episode
+    (table surface + half its own height) — defaults to 0.425, correct only
+    for the original fixed 5cm cube every caller assumed before block-size
+    randomization existed. Callers spawning a randomized-height block (see
+    env/block_randomization.py) must pass the actual per-episode value, or
+    `block_lifted` below silently misfires: a short block would need a much
+    bigger rise than intended to cross a fixed absolute threshold, a tall
+    one would cross it almost immediately, in both cases scrambling the
+    APPROACH->GRASP->CARRY phase transitions this heuristic (and anything
+    that fast-forwards through them, e.g. init_episode_before_subgoal) rely
+    on. Fixed 2026-08-10 (see hierarchical_architecture memory, Stage 4) —
+    previously an unparameterized `block_z > 0.45`.
 
     Grip convention: +1.0 = OPEN fingers, -1.0 = CLOSE fingers.
     """
@@ -39,7 +53,11 @@ def oracle_action(obs_arr, achieved_goal, desired_goal, carrying: bool = False):
     block_z = float(achieved_goal[2])
     grip_z  = block_z - float(rel[2])
 
-    block_lifted  = block_z > 0.45
+    # 0.025 preserves the ORIGINAL fixed-cube margin exactly (0.45 - 0.425)
+    # — not a new number, just the same margin re-expressed relative to
+    # this episode's own resting height instead of baked into an absolute
+    # constant.
+    block_lifted  = block_z > block_resting_z + 0.025
     # Once carrying, only exit if block escapes (wider tolerance than initial grasp).
     is_grasped    = (block_lifted and d_3d < 0.10) or (carrying and d_3d < 0.12)
     at_block_zone = grip_z <= block_z + 0.10
