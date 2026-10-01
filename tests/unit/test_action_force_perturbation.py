@@ -4,6 +4,7 @@ Unit tests for env.action_force_perturbation — pure numpy, no mujoco needed.
 import numpy as np
 import pytest
 
+from think_then_act.env import action_force_perturbation as afp
 from think_then_act.env.action_force_perturbation import (
     sample_singularity_perturbation, apply_singularity_perturbation,
     sample_force_perturbation, apply_force_perturbation,
@@ -17,6 +18,22 @@ class FakeModel:
     env/block_randomization.py) only ever keys off id(model), never its
     contents."""
     pass
+
+
+@pytest.fixture(autouse=True)
+def _clear_episode_state():
+    """
+    _EPISODE_STATE is keyed by id(model) — fine in production, where model
+    is a long-lived MuJoCo model object, but hazardous across these tests'
+    ephemeral FakeModel() instances: once one is garbage-collected, CPython
+    can reuse its exact memory address for a LATER FakeModel(), making
+    id(new_model) == id(old_model) and leaking the old test's state into
+    the new one. Clearing the dict before/after every test sidesteps this
+    entirely, independent of GC timing.
+    """
+    afp._EPISODE_STATE.clear()
+    yield
+    afp._EPISODE_STATE.clear()
 
 
 def test_singularity_disabled_is_exact_passthrough_and_consumes_no_rng():
