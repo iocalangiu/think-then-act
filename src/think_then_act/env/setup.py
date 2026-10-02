@@ -21,6 +21,16 @@ def save_video(frames: List[np.ndarray], path: str, fps: int = 10,
     Workaround: write frames as PNGs, then encode with the apt-installed
     system ffmpeg binary (which does have libx264).
 
+    `-movflags +faststart` (added 2026-10-02): without it, ffmpeg writes the
+    moov atom (the index a player needs before it can start decoding) at the
+    END of the file, after all frame data. Desktop players (QuickTime, VLC)
+    read the whole file first and don't care; a browser <video> element
+    streaming the file progressively does, and can fail or hang depending on
+    how the bytes are served. This flag moves the atom to the front after
+    encoding — a real correctness fix for any consumer that streams rather
+    than fully downloads first, independent of whatever else is going on
+    with a given delivery channel.
+
     `scale`, if given, is an ffmpeg scale filter arg, e.g. "320:-2".
     """
     import os, subprocess, tempfile
@@ -33,7 +43,7 @@ def save_video(frames: List[np.ndarray], path: str, fps: int = 10,
                "-i", os.path.join(tmp_dir, "%04d.png")]
         if scale:
             cmd += ["-vf", f"scale={scale}"]
-        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", path]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", path]
         subprocess.run(cmd, check=True, capture_output=True)
 
 
