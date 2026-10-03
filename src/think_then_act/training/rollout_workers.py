@@ -288,13 +288,25 @@ _SINGULARITY_FORCE_ENV_KWARGS = {
 def _worker_init_recurrent(env_kwargs: dict) -> None:
     """
     Recurrent-trainer counterpart of _worker_init — same env construction
-    (ObservationHarness -> setup_env -> SubgoalConditionedEnv, same
-    collision/pose/align_xy checkpoint-path loading), with
-    SingularityForceAugmentedEnv stacked on top. Duplicates _worker_init's
-    loading logic rather than factoring it out, since factoring would mean
-    editing _worker_init — accepted tradeoff, same as
-    RecurrentLowLevelPPOTrainer standing alone rather than subclassing
-    LowLevelPPOTrainer (see low_level_ppo_recurrent.py's docstring).
+    (setup_env -> SubgoalConditionedEnv, same collision/pose/align_xy
+    checkpoint-path loading), with SingularityForceAugmentedEnv stacked on
+    top. Duplicates _worker_init's loading logic rather than factoring it
+    out, since factoring would mean editing _worker_init — accepted
+    tradeoff, same as RecurrentLowLevelPPOTrainer standing alone rather
+    than subclassing LowLevelPPOTrainer (see low_level_ppo_recurrent.py's
+    docstring).
+
+    ONE deliberate divergence from _worker_init (2026-09-18, performance):
+    ObservationHarness + render_mode="rgb_array" is only constructed when
+    collision_model or pose_model is actually loaded — those are the ONLY
+    two things that ever call env.last_frame() (SubgoalConditionedEnv's
+    _collision_prob/_perceived_block_pos). Every other caller (this
+    trainer's own rollout loop included) never touches a rendered frame at
+    all, so rendering one via osmesa's software rasterizer on EVERY step
+    of EVERY episode was pure wasted cost during collection — measured to
+    dominate collect_s far more than the actual MuJoCo physics step or the
+    (tiny) recurrent network's forward pass. _worker_init itself is left
+    untouched; this optimization is scoped to the recurrent path only.
     """
     global _WORKER_ENV_RNN, _WORKER_MAX_STEPS_RNN
     import os
@@ -340,10 +352,18 @@ def _worker_init_recurrent(env_kwargs: dict) -> None:
         align_xy_policy.eval()
 
     max_episode_steps = env_kwargs["max_episode_steps"]
-    base = ObservationHarness(
-        gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
-                  max_episode_steps=max_episode_steps + 250)
-    )
+    # Only pay for offscreen rendering when something downstream actually
+    # reads a frame — collision_model/pose_model are the only two callers
+    # of env.last_frame() (see docstring above). Everything else, this
+    # trainer's own rollout loop included, never touches one.
+    needs_frames = collision_model is not None or pose_model is not None
+    if needs_frames:
+        base = ObservationHarness(
+            gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
+                      max_episode_steps=max_episode_steps + 250)
+        )
+    else:
+        base = gym.make("FetchPickAndPlace-v3", max_episode_steps=max_episode_steps + 250)
     setup_env(base)
     env_extra_kwargs = {}
     if "done_streak" in env_kwargs:
@@ -524,3 +544,135 @@ def collect_with_pool_recurrent(pool, actor_state, critic_state, obs_dim, action
         for seed in seeds
     ]
     return pool.map(_collect_one_recurrent, tasks)
+
+
+# ----------------------------------------------------------------------
+# Flat-full-task variant, for scripts/train_flat_task_ppo.py. Same
+# deliberate-isolation rationale as the recurrent block above (own
+# globals, own functions, zero reuse of _WORKER_ENV/_WORKER_ENV_RNN or
+# their init/run functions) — reuses _build_models_recurrent directly
+# though, since that one's already fully generic (obs_dim/action_dim/
+# hidden_dim/rnn_hidden_size only, no subgoal-specific coupling at all).
+# See training/flat_task_env.py for the env this collects against.
+# ----------------------------------------------------------------------
+
+_WORKER_ENV_FLAT       = None
+_WORKER_MAX_STEPS_FLAT = None
+
+
+def _worker_init_flat(env_kwargs: dict) -> None:
+    global _WORKER_ENV_FLAT, _WORKER_MAX_STEPS_FLAT
+    import os
+    os.environ["MUJOCO_GL"]         = "osmesa"
+    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+
+    import gymnasium as gym
+    import gymnasium_robotics  # noqa: F401
+
+    from think_then_act.env.setup import setup_env
+    from think_then_act.reward.flat_task_reward import FlatTaskWeights
+    from think_then_act.training.flat_task_env import FlatTaskEnv
+
+    max_episode_steps = env_kwargs["max_episode_steps"]
+    base = gym.make("FetchPickAndPlace-v3", max_episode_steps=max_episode_steps)
+    setup_env(base)
+    weights_kwargs = env_kwargs.get("weights_kwargs") or {}
+    env = FlatTaskEnv(base, weights=FlatTaskWeights(**weights_kwargs),
+                       block_resting_z=env_kwargs.get("block_resting_z", 0.425))
+
+    _WORKER_ENV_FLAT       = env
+    _WORKER_MAX_STEPS_FLAT = max_episode_steps
+
+
+def _run_episode_flat(actor, critic, seed: int) -> dict:
+    """
+    Same shape/rationale as _run_episode_recurrent. Additionally
+    accumulates the flat-task-specific diagnostics FlatTaskEnv's info dict
+    carries every step (discrepancy, block_xy_delta, carrying) so
+    train_flat_task_ppo.py can report whether the two targeted behaviors
+    (wasted joint motion, block dragging) are actually improving over
+    training, not just completion_rate.
+    """
+    import torch
+
+    env = _WORKER_ENV_FLAT
+    rng = np.random.default_rng(seed)
+    obs, info = env.reset(rng=rng)
+
+    steps = []
+    terminated = truncated = False
+    discrepancies = []
+    drag_steps = 0
+    genuine_success = False
+    actor_h = None
+    critic_h = None
+    with torch.no_grad():
+        for _ in range(_WORKER_MAX_STEPS_FLAT):
+            obs_arr = np.asarray(obs, dtype=np.float32)
+            obs_t = torch.from_numpy(obs_arr).unsqueeze(0)
+            action_t, raw_sample_t, log_prob_t, _, actor_h = actor.sample(obs_t, actor_h)
+            value_t, critic_h = critic(obs_t, critic_h)
+            action = action_t.squeeze(0).numpy()
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            discrepancies.append(float(info["discrepancy"]))
+            if info["block_xy_delta"] > 0.004 and not info["genuine_grasp_now"]:
+                drag_steps += 1
+            if info.get("done", False):
+                genuine_success = True
+            steps.append({
+                "obs"         : obs_arr,
+                "raw_sample"  : raw_sample_t.squeeze(0).numpy(),
+                "old_log_prob": float(log_prob_t.item()),
+                "value"       : float(value_t.item()),
+                "reward"      : float(reward),
+            })
+            obs = next_obs
+            if terminated or truncated:
+                break
+
+        if terminated:
+            bootstrap_value = 0.0
+        else:
+            obs_t = torch.from_numpy(np.asarray(obs, dtype=np.float32)).unsqueeze(0)
+            bootstrap_value_t, _ = critic(obs_t, critic_h)
+            bootstrap_value = float(bootstrap_value_t.item())
+
+    return {
+        "steps"           : steps,
+        "bootstrap_value" : bootstrap_value,
+        "total_reward"    : float(sum(s["reward"] for s in steps)),
+        "n_steps"         : len(steps),
+        "genuine_success" : genuine_success,
+        "mean_discrepancy": float(np.mean(discrepancies)) if discrepancies else None,
+        "drag_steps"      : drag_steps,
+    }
+
+
+def _collect_one_flat(task: tuple) -> dict:
+    actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, seed = task
+    actor, critic = _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size)
+    return _run_episode_flat(actor, critic, seed)
+
+
+def collect_serial_flat(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size,
+                         seeds: list, env_kwargs: dict) -> list:
+    if _WORKER_ENV_FLAT is None:
+        _worker_init_flat(env_kwargs)
+    actor, critic = _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size)
+    return [_run_episode_flat(actor, critic, seed) for seed in seeds]
+
+
+def make_pool_flat(env_kwargs: dict, n_workers: int):
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    return ctx.Pool(processes=n_workers, initializer=_worker_init_flat, initargs=(env_kwargs,))
+
+
+def collect_with_pool_flat(pool, actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size,
+                            seeds: list) -> list:
+    tasks = [
+        (actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, seed)
+        for seed in seeds
+    ]
+    return pool.map(_collect_one_flat, tasks)

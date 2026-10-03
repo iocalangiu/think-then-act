@@ -100,6 +100,11 @@ class RecurrentLowLevelPPOTrainer:
             itertools.chain(self.actor.parameters(), self.critic.parameters()),
             lr=self.config.lr,
         )
+        # Separate from self.optimizer deliberately — critic_warmup_step must
+        # never touch the actor, and using a dedicated optimizer (rather than
+        # zeroing/freezing actor.requires_grad around a shared optimizer)
+        # means that guarantee holds structurally, not by convention.
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.config.lr)
 
     # ------------------------------------------------------------------
     # Rollout collection (recurrent-policy pool — see rollout_workers.py's
@@ -141,6 +146,104 @@ class RecurrentLowLevelPPOTrainer:
             self.config.obs_dim, self.config.action_dim, self.config.hidden_dim, self.config.rnn_hidden_size,
             seeds,
         )
+
+    # ------------------------------------------------------------------
+    # Critic-only warmup — no policy update at all. Intended for a handful
+    # of iterations before the first real ppo_step call when warm-starting
+    # from a checkpoint whose critic was never actually trained (e.g.
+    # behavioral_cloning.py's saved critic, which is fresh/random by
+    # design — BC has no value function of its own). An untrained critic
+    # gives near-random GAE advantages for the first several iterations of
+    # ORDINARY joint actor+critic training, and a noisy/misleading policy
+    # gradient derived from those advantages can meaningfully erode an
+    # already-good warm-started actor before the critic catches up — see
+    # scripts/train_low_level_ppo_recurrent.py's --critic-warmup-iters
+    # (added 2026-09-18 after exactly this: a BC-warm-started align_xy run
+    # regressed from ~45% success to 0% completion_rate within 50
+    # iterations, with entropy never moving off its std=1 initial value).
+    # ------------------------------------------------------------------
+    def critic_warmup_step(self, rollouts: list) -> dict:
+        import torch
+        from think_then_act.training.low_level_ppo import LowLevelPPOTrainer
+
+        episodes = []
+        for r in rollouts:
+            rewards = np.array([s["reward"] for s in r["steps"]], dtype=np.float64)
+            values  = np.array([s["value"]  for s in r["steps"]], dtype=np.float64)
+            _, returns = LowLevelPPOTrainer.compute_gae(
+                rewards, values, r["bootstrap_value"], self.config.gamma, self.config.gae_lambda,
+            )
+            episodes.append({
+                "obs": np.stack([s["obs"] for s in r["steps"]]).astype(np.float32),
+                "ret": returns.astype(np.float32),
+                "T": len(r["steps"]),
+            })
+
+        n_eps = len(episodes)
+        value_losses = []
+        for _ in range(self.config.n_epochs):
+            perm = torch.randperm(n_eps)
+            for start in range(0, n_eps, self.config.episodes_per_minibatch):
+                idx = perm[start:start + self.config.episodes_per_minibatch]
+                batch = [episodes[i] for i in idx.tolist()]
+                T_max = max(ep["T"] for ep in batch)
+                B = len(batch)
+
+                obs_batch = torch.zeros(B, T_max, self.config.obs_dim)
+                ret_batch = torch.zeros(B, T_max)
+                mask = torch.zeros(B, T_max)
+                for b, ep in enumerate(batch):
+                    T = ep["T"]
+                    obs_batch[b, :T] = torch.from_numpy(ep["obs"])
+                    ret_batch[b, :T] = torch.from_numpy(ep["ret"])
+                    mask[b, :T] = 1.0
+
+                hidden_state = torch.zeros(1, B, self.config.rnn_hidden_size)
+                values, _ = self.critic(obs_batch, hidden_state)
+                mask_sum = mask.sum().clamp(min=1.0)
+                value_loss = (mask * (values - ret_batch) ** 2).sum() / mask_sum
+
+                self.critic_optimizer.zero_grad()
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
+                self.critic_optimizer.step()
+
+                value_losses.append(float(value_loss.item()))
+
+        return {"value_loss": float(np.mean(value_losses))}
+
+    # ------------------------------------------------------------------
+    # Masked clipped-surrogate PPO loss for one (B, T_max, ...) padded
+    # minibatch — factored out of ppo_step so the masking behavior itself
+    # (padded steps must contribute exactly nothing) is directly unit-
+    # testable without needing to go through episode-dict/T-inference
+    # plumbing. Every episode's GRU hidden state starts from zero — see
+    # module docstring's whole-episode-BPTT scope note.
+    # ------------------------------------------------------------------
+    def _compute_masked_losses(self, obs_batch, raw_batch, old_lp_batch, adv_batch, ret_batch, mask, clip_eps: float) -> dict:
+        import torch
+
+        B = obs_batch.shape[0]
+        hidden_state = torch.zeros(1, B, self.config.rnn_hidden_size)
+        log_probs, entropies, _ = self.actor.recompute_log_prob(obs_batch, raw_batch, hidden_state)
+        values, _ = self.critic(obs_batch, hidden_state)
+
+        ratio = torch.exp(log_probs - old_lp_batch)
+        surr1 = ratio * adv_batch
+        surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_batch
+        mask_sum = mask.sum().clamp(min=1.0)
+        policy_loss  = -(mask * torch.min(surr1, surr2)).sum() / mask_sum
+        value_loss   = (mask * (values - ret_batch) ** 2).sum() / mask_sum
+        entropy_mean = (mask * entropies).sum() / mask_sum
+
+        with torch.no_grad():
+            approx_kl = (((old_lp_batch - log_probs) * mask).sum() / mask_sum).item()
+            clip_fraction = ((((torch.abs(ratio - 1.0) > clip_eps).float()) * mask).sum() / mask_sum).item()
+
+        return {
+            "policy_loss": policy_loss, "value_loss": value_loss, "entropy_mean": entropy_mean,
+            "approx_kl": approx_kl, "clip_fraction": clip_fraction,
+        }
 
     # ------------------------------------------------------------------
     # One PPO update: per-episode GAE (unchanged math), then masked,

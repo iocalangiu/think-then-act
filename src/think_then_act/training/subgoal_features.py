@@ -47,6 +47,18 @@ from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
 SUBGOAL_OBS_DIM        = 25 + 3 + 3 + len(SUBGOAL_LABELS) + 1
 CLOSE_GRIPPER_OBS_DIM  = SUBGOAL_OBS_DIM + 3  # + perceived [width, length, height]
 
+# FLAT_OBS_DIM: the phase-agnostic layout used by a single generic
+# whole-task policy (see hierarchical_architecture memory's "flat full-task
+# pivot" — no subgoal one-hot, no collision_prob, since a flat policy
+# doesn't condition on a subgoal selection at all). Exactly
+# _relative_geometry_features()'s output — the same frame-invariant
+# relative geometry RELATIVE_OBS_SUBGOALS already uses, just without the
+# onehot(6)/collision_prob(1) tail those subgoal-conditioned policies add.
+#   layout: object_rel_pos(3) + gripper_state(2) + object_rot(3)
+#         + object_velp(3) + object_velr(3) + grip_velp(3) + gripper_vel(2)
+#         + goal_rel_pos(3) = 22
+FLAT_OBS_DIM = 22
+
 # RELATIVE_OBS_SUBGOALS, started 2026-09-01 with align_xy: every OTHER
 # subgoal still uses SUBGOAL_OBS_DIM's absolute grip_pos(3)/object_pos(3) +
 # separate achieved_goal(3)/desired_goal(3). align_xy's own reward
@@ -141,6 +153,55 @@ def sanitize_observation_for_perception(observation, block_pos) -> np.ndarray:
     return sanitized
 
 
+def _relative_geometry_features(observation, achieved_goal, desired_goal) -> np.ndarray:
+    """
+    (FLAT_OBS_DIM,) float32 — object_rel_pos(3) + gripper_state(2) +
+    object_rot(3) + object_velp(3) + object_velr(3) + grip_velp(3) +
+    gripper_vel(2) + goal_rel_pos(3) = 22. Frame-invariant by construction
+    (translating grip/object/goal by any constant vector leaves every
+    feature unchanged) — see RELATIVE_OBS_SUBGOALS's comment for the
+    sim2real motivation. Shared by build_subgoal_observation's
+    RELATIVE_OBS_SUBGOALS branch (which appends a subgoal one-hot +
+    collision_prob) and build_flat_observation (which doesn't, since a flat
+    whole-task policy has no subgoal to condition on).
+    """
+    obs = np.asarray(observation, dtype=np.float32).reshape(-1)
+    achieved = np.asarray(achieved_goal, dtype=np.float32).reshape(-1)
+    desired  = np.asarray(desired_goal,  dtype=np.float32).reshape(-1)
+    grip_pos = obs[0:3]
+    # Computed fresh from achieved_goal/grip_pos rather than reusing
+    # obs[6:9] (gymnasium_robotics's own object_rel_pos) deliberately —
+    # obs[6:9] is always ground-truth-computed by the sim engine directly,
+    # independent of whatever caller-supplied achieved_goal is passed in
+    # (e.g. a perception-noise estimate). Reusing it here would silently
+    # leak true block position past a noisy achieved_goal — the exact bug
+    # sanitize_observation_for_perception's docstring describes and fixes
+    # for the OTHER subgoals' obs[3:6]/[6:9].
+    object_rel_pos = achieved - grip_pos
+    goal_rel_pos    = desired - achieved
+    return np.concatenate([
+        object_rel_pos,
+        obs[9:11],    # gripper_state
+        obs[11:14],   # object_rot
+        obs[14:17],   # object_velp
+        obs[17:20],   # object_velr
+        obs[20:23],   # grip_velp
+        obs[23:25],   # gripper_vel
+        goal_rel_pos,
+    ])
+
+
+def build_flat_observation(observation, achieved_goal, desired_goal) -> np.ndarray:
+    """
+    (FLAT_OBS_DIM,) float32 — the generic, phase-agnostic observation for a
+    single flat whole-task policy (no subgoal conditioning, no collision
+    feature). Just _relative_geometry_features() directly; see that
+    function's docstring for the layout and the sim2real frame-invariance
+    rationale.
+    """
+    return _relative_geometry_features(observation, achieved_goal, desired_goal)
+
+
 def build_subgoal_observation(
     observation, achieved_goal, desired_goal,
     subgoal: str, collision_prob: float,
@@ -164,29 +225,9 @@ def build_subgoal_observation(
     no absolute position).
     """
     if subgoal in RELATIVE_OBS_SUBGOALS:
-        obs = np.asarray(observation, dtype=np.float32).reshape(-1)
-        achieved = np.asarray(achieved_goal, dtype=np.float32).reshape(-1)
-        desired  = np.asarray(desired_goal,  dtype=np.float32).reshape(-1)
-        grip_pos = obs[0:3]
-        # Computed fresh from achieved_goal/grip_pos rather than reusing
-        # obs[6:9] (gymnasium_robotics's own object_rel_pos) deliberately —
-        # obs[6:9] is always ground-truth-computed by the sim engine
-        # directly, independent of whatever caller-supplied achieved_goal
-        # is passed in (e.g. a perception-noise estimate). Reusing it here
-        # would silently leak true block position past a noisy achieved_goal
-        # the exact bug sanitize_observation_for_perception's docstring
-        # describes and fixes for the OTHER subgoals' obs[3:6]/[6:9].
-        object_rel_pos = achieved - grip_pos
-        goal_rel_pos    = desired - achieved
+        relative = _relative_geometry_features(observation, achieved_goal, desired_goal)
         parts = [
-            object_rel_pos,
-            obs[9:11],    # gripper_state
-            obs[11:14],   # object_rot
-            obs[14:17],   # object_velp
-            obs[17:20],   # object_velr
-            obs[20:23],   # grip_velp
-            obs[23:25],   # gripper_vel
-            goal_rel_pos,
+            relative,
             subgoal_to_onehot(subgoal),
             np.array([collision_prob], dtype=np.float32),
         ]
