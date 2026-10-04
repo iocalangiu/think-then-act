@@ -42,20 +42,42 @@ class FlatTaskEnv(gym.Wrapper):
     obs_dim = FLAT_OBS_DIM
 
     def __init__(self, env, weights: FlatTaskWeights = DEFAULT_FLAT_TASK_WEIGHTS,
-                 block_resting_z: float = 0.425):
+                 block_resting_z: float = 0.425, randomize_pose_prob: float = 0.0,
+                 pose_exclude_band: float = 0.35, pose_max_frac: float = 0.85):
+        """
+        randomize_pose_prob: fraction of episodes that start from a
+        randomized arm joint configuration (env.setup.randomize_joint_
+        angles) instead of the one fixed pose every episode used before
+        2026-10-03. Defaults to 0.0 — PRESERVES old behavior for any
+        existing caller. Added after finding that warm-starting PPO from
+        a pose-randomized BC checkpoint isn't enough on its own: if PPO's
+        own ROLLOUT COLLECTION never samples a randomized pose either, it
+        has no training signal keeping that generalization and can erode
+        it over many iterations, same as how a fixed-pose-only demo pool
+        produced a fixed-pose-only policy in the first place.
+        """
         super().__init__(env)
         self.weights = weights
         self.block_resting_z = block_resting_z
+        self.randomize_pose_prob = randomize_pose_prob
+        self.pose_exclude_band = pose_exclude_band
+        self.pose_max_frac = pose_max_frac
         self._ever_genuinely_grasped = False
         self._prev_grip_pos = None
         self._prev_block_xy = None
 
     def reset(self, *, rng=None, seed=None, options=None):
-        from think_then_act.env.setup import init_random_episode
+        from think_then_act.env.setup import init_random_episode, randomize_joint_angles
 
         self.env.reset(seed=seed)
         if rng is None:
             rng = np.random.default_rng()
+        if rng.uniform(0.0, 1.0) < self.randomize_pose_prob:
+            obs, pose_ok = randomize_joint_angles(
+                self.env, rng, exclude_band=self.pose_exclude_band, max_frac=self.pose_max_frac,
+            )
+            if not pose_ok:
+                return self.reset(rng=rng, seed=seed, options=options)
         obs, setup_ok = init_random_episode(self.env, rng)
         self._ever_genuinely_grasped = False
         self._prev_grip_pos = np.asarray(obs["observation"][:3], dtype=np.float64).copy()

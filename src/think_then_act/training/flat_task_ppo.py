@@ -47,6 +47,16 @@ class FlatTaskPPOConfig:
         n_workers: int = 8,
         weights_kwargs: dict = None,
         block_resting_z: float = 0.425,
+        randomize_pose_prob: float = 0.0,
+        pose_exclude_band: float = 0.35,
+        pose_max_frac: float = 0.85,
+        env_variant: str = "single",   # "single" (FlatTaskEnv, default -- every existing
+                                  # caller/checkpoint is unaffected) or "multicube"
+                                  # (MultiCubeStackEnv, training/multicube_stack_env.py)
+        min_cubes: int = 1,
+        max_cubes: int = 3,
+        precision_weight: float = 10.0,
+        disturbance_weight: float = 15.0,
     ) -> None:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -66,6 +76,14 @@ class FlatTaskPPOConfig:
         self.n_workers = n_workers
         self.weights_kwargs = weights_kwargs or {}
         self.block_resting_z = block_resting_z
+        self.randomize_pose_prob = randomize_pose_prob
+        self.pose_exclude_band = pose_exclude_band
+        self.pose_max_frac = pose_max_frac
+        self.env_variant = env_variant
+        self.min_cubes = min_cubes
+        self.max_cubes = max_cubes
+        self.precision_weight = precision_weight
+        self.disturbance_weight = disturbance_weight
 
     def as_dict(self) -> dict:
         return {k: v for k, v in vars(self).items()}
@@ -75,6 +93,14 @@ class FlatTaskPPOConfig:
             "max_episode_steps": self.max_episode_steps,
             "weights_kwargs": self.weights_kwargs,
             "block_resting_z": self.block_resting_z,
+            "randomize_pose_prob": self.randomize_pose_prob,
+            "pose_exclude_band": self.pose_exclude_band,
+            "pose_max_frac": self.pose_max_frac,
+            "env_variant": self.env_variant,
+            "min_cubes": self.min_cubes,
+            "max_cubes": self.max_cubes,
+            "precision_weight": self.precision_weight,
+            "disturbance_weight": self.disturbance_weight,
         }
 
 

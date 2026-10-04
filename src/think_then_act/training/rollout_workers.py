@@ -561,6 +561,18 @@ _WORKER_MAX_STEPS_FLAT = None
 
 
 def _worker_init_flat(env_kwargs: dict) -> None:
+    """
+    env_kwargs["env_variant"] ("single", default, or "multicube")
+    dispatches which env class this worker builds -- added 2026-10-03 for
+    training/multicube_stack_env.py's MultiCubeStackEnv, kept as a branch
+    inside this SAME function (rather than a parallel _worker_init_flat_
+    multicube) so _ensure_pool/make_pool_flat/_run_episode_flat all stay
+    unchanged -- MultiCubeStackEnv implements the identical reset(rng=...)
+    -> (flat_obs, info) / step(action) -> (flat_obs, reward, terminated,
+    truncated, info) interface, with the same "discrepancy"/"block_xy_
+    delta"/"genuine_grasp_now"/"done" info keys _run_episode_flat reads,
+    so it's a drop-in for everything downstream of this function.
+    """
     global _WORKER_ENV_FLAT, _WORKER_MAX_STEPS_FLAT
     import os
     os.environ["MUJOCO_GL"]         = "osmesa"
@@ -571,14 +583,32 @@ def _worker_init_flat(env_kwargs: dict) -> None:
 
     from think_then_act.env.setup import setup_env
     from think_then_act.reward.flat_task_reward import FlatTaskWeights
-    from think_then_act.training.flat_task_env import FlatTaskEnv
 
     max_episode_steps = env_kwargs["max_episode_steps"]
-    base = gym.make("FetchPickAndPlace-v3", max_episode_steps=max_episode_steps)
-    setup_env(base)
     weights_kwargs = env_kwargs.get("weights_kwargs") or {}
-    env = FlatTaskEnv(base, weights=FlatTaskWeights(**weights_kwargs),
-                       block_resting_z=env_kwargs.get("block_resting_z", 0.425))
+
+    if env_kwargs.get("env_variant", "single") == "multicube":
+        from think_then_act.training.multicube_stack_env import MultiCubeStackEnv
+        env = MultiCubeStackEnv(
+            weights=FlatTaskWeights(**weights_kwargs),
+            min_cubes=env_kwargs.get("min_cubes", 1),
+            max_cubes=env_kwargs.get("max_cubes", 3),
+            max_episode_steps=max_episode_steps,
+            randomize_pose_prob=env_kwargs.get("randomize_pose_prob", 1.0),
+            pose_exclude_band=env_kwargs.get("pose_exclude_band", 0.35),
+            pose_max_frac=env_kwargs.get("pose_max_frac", 0.85),
+            precision_weight=env_kwargs.get("precision_weight", 10.0),
+            disturbance_weight=env_kwargs.get("disturbance_weight", 15.0),
+        )
+    else:
+        from think_then_act.training.flat_task_env import FlatTaskEnv
+        base = gym.make("FetchPickAndPlace-v3", max_episode_steps=max_episode_steps)
+        setup_env(base)
+        env = FlatTaskEnv(base, weights=FlatTaskWeights(**weights_kwargs),
+                           block_resting_z=env_kwargs.get("block_resting_z", 0.425),
+                           randomize_pose_prob=env_kwargs.get("randomize_pose_prob", 0.0),
+                           pose_exclude_band=env_kwargs.get("pose_exclude_band", 0.35),
+                           pose_max_frac=env_kwargs.get("pose_max_frac", 0.85))
 
     _WORKER_ENV_FLAT       = env
     _WORKER_MAX_STEPS_FLAT = max_episode_steps
