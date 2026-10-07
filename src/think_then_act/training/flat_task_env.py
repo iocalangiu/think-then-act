@@ -43,18 +43,32 @@ class FlatTaskEnv(gym.Wrapper):
 
     def __init__(self, env, weights: FlatTaskWeights = DEFAULT_FLAT_TASK_WEIGHTS,
                  block_resting_z: float = 0.425, randomize_pose_prob: float = 0.0,
-                 pose_exclude_band: float = 0.35, pose_max_frac: float = 0.85):
+                 pose_exclude_band: float = 0.35, pose_max_frac: float = 0.85,
+                 pose_scheme: str = "joint_angles"):
         """
         randomize_pose_prob: fraction of episodes that start from a
-        randomized arm joint configuration (env.setup.randomize_joint_
-        angles) instead of the one fixed pose every episode used before
-        2026-10-03. Defaults to 0.0 — PRESERVES old behavior for any
-        existing caller. Added after finding that warm-starting PPO from
-        a pose-randomized BC checkpoint isn't enough on its own: if PPO's
-        own ROLLOUT COLLECTION never samples a randomized pose either, it
-        has no training signal keeping that generalization and can erode
-        it over many iterations, same as how a fixed-pose-only demo pool
-        produced a fixed-pose-only policy in the first place.
+        randomized arm pose instead of the one fixed pose every episode
+        used before 2026-10-03. Defaults to 0.0 — PRESERVES old behavior
+        for any existing caller. Added after finding that warm-starting
+        PPO from a pose-randomized BC checkpoint isn't enough on its own:
+        if PPO's own ROLLOUT COLLECTION never samples a randomized pose
+        either, it has no training signal keeping that generalization and
+        can erode it over many iterations, same as how a fixed-pose-only
+        demo pool produced a fixed-pose-only policy in the first place.
+
+        pose_scheme: "joint_angles" (default, env.setup.randomize_joint_
+        angles — byte-for-byte unchanged behavior for every existing
+        caller) or "gripper_3d" (env.setup.randomize_gripper_start_3d,
+        2026-10-04 — drives the gripper via real bounded actions toward a
+        randomized 3D point instead of sampling joint angles
+        independently; validated as visually natural, non-"torturous" via
+        the skeleton-overlay comparison in the "Pose Generalization &
+        Stacking" artifact, but IS a materially different distribution a
+        checkpoint trained only on "joint_angles" won't transfer to for
+        free — confirmed directly, 35% vs 83.3% cube-success on the same
+        checkpoint — hence this option, for training a NEW checkpoint on
+        it from the start, not for swapping under an existing one).
+        pose_exclude_band/pose_max_frac apply only to "joint_angles".
         """
         super().__init__(env)
         self.weights = weights
@@ -62,20 +76,26 @@ class FlatTaskEnv(gym.Wrapper):
         self.randomize_pose_prob = randomize_pose_prob
         self.pose_exclude_band = pose_exclude_band
         self.pose_max_frac = pose_max_frac
+        self.pose_scheme = pose_scheme
         self._ever_genuinely_grasped = False
         self._prev_grip_pos = None
         self._prev_block_xy = None
 
     def reset(self, *, rng=None, seed=None, options=None):
-        from think_then_act.env.setup import init_random_episode, randomize_joint_angles
+        from think_then_act.env.setup import (
+            init_random_episode, randomize_joint_angles, randomize_gripper_start_3d,
+        )
 
-        self.env.reset(seed=seed)
+        reset_obs, _ = self.env.reset(seed=seed)
         if rng is None:
             rng = np.random.default_rng()
         if rng.uniform(0.0, 1.0) < self.randomize_pose_prob:
-            obs, pose_ok = randomize_joint_angles(
-                self.env, rng, exclude_band=self.pose_exclude_band, max_frac=self.pose_max_frac,
-            )
+            if self.pose_scheme == "gripper_3d":
+                obs, pose_ok, _ = randomize_gripper_start_3d(self.env, rng, reset_obs)
+            else:
+                obs, pose_ok = randomize_joint_angles(
+                    self.env, rng, exclude_band=self.pose_exclude_band, max_frac=self.pose_max_frac,
+                )
             if not pose_ok:
                 return self.reset(rng=rng, seed=seed, options=options)
         obs, setup_ok = init_random_episode(self.env, rng)

@@ -12,7 +12,7 @@ every other new env/script this session (randomize_joint_angles, the
 3-cube XML patcher, etc. were all frame-checked before being relied on).
 
 Run with:
-    modal run scripts/smoketest_multicube_env.py
+    modal run scripts/multi-cube-experiment/smoketest_multicube_env.py
 """
 
 import modal

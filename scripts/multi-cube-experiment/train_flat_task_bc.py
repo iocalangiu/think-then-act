@@ -32,8 +32,8 @@ regardless of outcome" miss from collect_sb3_teacher_demos.py's early
 videos) to demonstrations/videos/ for the Fetch Policy Telemetry dashboard.
 
 Run with:
-    modal run scripts/train_flat_task_bc.py
-    modal run scripts/train_flat_task_bc.py --n-epochs 40 --n-eval-episodes 30
+    modal run scripts/multi-cube-experiment/train_flat_task_bc.py
+    modal run scripts/multi-cube-experiment/train_flat_task_bc.py --n-epochs 40 --n-eval-episodes 30
 """
 
 import modal

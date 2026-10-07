@@ -21,8 +21,8 @@ lift/height thresholds) at some point before is_success fires — sliding
 keeps the block near table height with no sustained two-finger contact.
 
 Run with:
-    modal run scripts/diagnose_flat_bc_success_quality.py
-    modal run scripts/diagnose_flat_bc_success_quality.py --n-seeds 40
+    modal run scripts/multi-cube-experiment/diagnose_flat_bc_success_quality.py
+    modal run scripts/multi-cube-experiment/diagnose_flat_bc_success_quality.py --n-seeds 40
 """
 
 import modal

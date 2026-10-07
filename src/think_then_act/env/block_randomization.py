@@ -31,10 +31,15 @@ it does NOT call mj_forward itself (teleport_block already does, right
 after, so physics picks up the new geometry for free as long as this runs
 first; calling mj_forward twice per reset would be wasted work).
 
-Mass/inertia deliberately NOT touched when resizing (user's explicit call,
-2026-08-09) — a bigger block ends up unrealistically light relative to a
-real object of that size. A deliberate simplification for this pass, not
-an oversight.
+Mass/inertia now scaled WITH size (user's reversal, 2026-08-17, of the
+original 2026-08-09 "leave it fixed" call — a bigger block being no
+heavier than a small one was judged unrealistic enough to fix once the
+grip-force/lift dynamics needed to work across the full size range).
+Density-consistent: the reference density is derived once, per model,
+from that model's own ORIGINAL (pre-randomization) body_mass and
+geom_size — not a hardcoded constant — so every sampled size gets a
+volume-proportional mass/inertia consistent with the one real mass value
+MuJoCo's fetch asset actually ships. See `_reference_density`.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ HEIGHT_RANGE = (0.01, 0.08)  # metres, full extent along z
 PERCEIVED_DIMS_NOISE_STD = 0.005  # metres
 
 _EPISODE_STATE: dict = {}  # id(model) -> {"width","length","height","perceived": np.ndarray(3,)}
+_REFERENCE_DENSITY: dict = {}  # id(model) -> kg/m^3, captured from the model's ORIGINAL mass/size
 
 
 def _block_geom_id(model) -> int:
@@ -65,6 +71,28 @@ def _block_geom_id(model) -> int:
         if model.geom_bodyid[gid] == body_id:
             return gid
     raise RuntimeError(f"No geom found for body {BLOCK_BODY_NAME!r}")
+
+
+def _reference_density(model, gid: int) -> float:
+    """
+    kg/m^3, derived ONCE per model from its own pre-randomization
+    body_mass/geom_size (asset's real fixed-cube mass / its real volume) —
+    not a hardcoded constant, so this stays correct even if the underlying
+    asset's mass ever changes. Must be read before the FIRST
+    sample_and_apply_block_size() call for a given model mutates geom_size
+    out from under it; cached afterward (same id(model)-keyed pattern as
+    _EPISODE_STATE) so later episodes reuse the one true reference instead
+    of computing it from an already-resized block.
+    """
+    cached = _REFERENCE_DENSITY.get(id(model))
+    if cached is not None:
+        return cached
+    body_id = model.geom_bodyid[gid]
+    length2, width2, height2 = model.geom_size[gid]
+    original_volume = (2 * length2) * (2 * width2) * (2 * height2)
+    density = float(model.body_mass[body_id]) / original_volume
+    _REFERENCE_DENSITY[id(model)] = density
+    return density
 
 
 def sample_and_apply_block_size(
@@ -83,17 +111,37 @@ def sample_and_apply_block_size(
     relative to it wouldn't produce a fresh independent reading every
     control step.
 
+    Also rescales mass/inertia to match the new size at a constant,
+    per-model reference density (see _reference_density) — MUST run before
+    mutating geom_size, since the reference is derived from the model's
+    original (not-yet-resized) mass/geom_size on first call.
+
     Returns {"width","length","height","perceived"} (also cached under
     id(model) — see get_block_dims/get_perceived_block_dims for reading it
     back later in the episode without re-deriving or accidentally
     re-sampling a different value).
     """
     gid = _block_geom_id(model)
+    density = _reference_density(model, gid)
 
     width  = float(rng.uniform(*width_range))
     length = float(rng.uniform(*length_range))
     height = float(rng.uniform(*height_range))
     model.geom_size[gid] = [length / 2.0, width / 2.0, height / 2.0]
+
+    # Box inertia about its own center, in the body's local frame — valid
+    # here because the block is always spawned axis-aligned (identity qpos
+    # quaternion, see module docstring), so geom-local axes == body-local
+    # axes == world axes, and body_inertia's diagonal-frame assumption holds
+    # without needing body_iquat correction.
+    body_id = model.geom_bodyid[gid]
+    mass = density * (width * length * height)
+    model.body_mass[body_id] = mass
+    model.body_inertia[body_id] = [
+        mass / 12.0 * (width ** 2 + height ** 2),
+        mass / 12.0 * (length ** 2 + height ** 2),
+        mass / 12.0 * (length ** 2 + width ** 2),
+    ]
 
     true_dims = np.array([width, length, height], dtype=np.float64)
     # Clipped at a small positive floor — noise on a true dim near the 0.01m

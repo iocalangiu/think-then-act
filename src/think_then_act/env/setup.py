@@ -60,11 +60,18 @@ def setup_env(env) -> None:
     mujoco.mj_forward(raw.model, raw.data)
 
 
-def teleport_block(env, target_xyz) -> None:
-    """Move block to target_xyz by setting its free-joint qpos directly."""
+def teleport_block(env, target_xyz, joint_name: str = "object0:joint") -> None:
+    """
+    Move a free-floating block to target_xyz by setting its joint qpos
+    directly. joint_name defaults to the native single-object env's own
+    "object0:joint" (byte-identical behavior for every existing caller);
+    pass e.g. "object1:joint" for an extra body added via a patched MJCF
+    (see scripts/eval_stack3_cubes.py) — any free joint works the same
+    way, there's nothing object0-specific about the mechanism itself.
+    """
     import mujoco
     raw      = env.unwrapped
-    joint_id = mujoco.mj_name2id(raw.model, mujoco.mjtObj.mjOBJ_JOINT, "object0:joint")
+    joint_id = mujoco.mj_name2id(raw.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
     qpos_adr = raw.model.jnt_qposadr[joint_id]
     dof_adr  = raw.model.jnt_dofadr[joint_id]
     raw.data.qpos[qpos_adr:qpos_adr + 3]     = np.array(target_xyz, dtype=np.float64)
@@ -124,7 +131,7 @@ _LEFT_FINGER_BODY  = "robot0:l_gripper_finger_link"
 _RIGHT_FINGER_BODY = "robot0:r_gripper_finger_link"
 
 
-def grip_contact_forces(env) -> dict:
+def grip_contact_forces(env, block_body_name: str = BLOCK_BODY_NAME) -> dict:
     """
     Normal-force magnitude (mujoco.mj_contactForce) between EACH gripper
     finger and the block, read directly from the physics contact solver —
@@ -137,6 +144,13 @@ def grip_contact_forces(env) -> dict:
     Gaussian (close_gripper_target_width) specifically so the reward
     generalizes to blocks of any size/shape, not just the one 5cm cube it
     was originally calibrated against.
+
+    block_body_name defaults to BLOCK_BODY_NAME ("object0", the native
+    single-object env's only block — byte-identical behavior for every
+    existing caller); pass e.g. "object1" for an extra body added via a
+    patched MJCF (see scripts/eval_stack3_cubes.py) to check THAT body's
+    contact instead — the contact solver doesn't care which body is
+    "the" object, that's purely a convention of this one default.
 
     Same per-step data.contact iteration as get_contact_geoms, but that
     function only returns body-NAME pairs, not force — needed separately
@@ -160,7 +174,7 @@ def grip_contact_forces(env) -> dict:
         body1 = mujoco.mj_id2name(raw.model, mujoco.mjtObj.mjOBJ_BODY, raw.model.geom_bodyid[c.geom1]) or ""
         body2 = mujoco.mj_id2name(raw.model, mujoco.mjtObj.mjOBJ_BODY, raw.model.geom_bodyid[c.geom2]) or ""
         pair = {body1, body2}
-        if BLOCK_BODY_NAME not in pair:
+        if block_body_name not in pair:
             continue
         finger_body = next((b for b in pair if b in finger_side), None)
         if finger_body is None:
@@ -715,3 +729,180 @@ def randomize_gripper_start(
         "actual_start_xy": actual_xy,
     }
     return obs, not (done or trunc), info
+
+
+def randomize_gripper_start_3d(
+    env, rng, obs, margin: float = 0.10, z_range: tuple = (0.05, 0.35),
+    n_position_steps: int = 60, pos_scale: float = 0.05,
+) -> tuple:
+    """
+    Built 2026-10-04 as the PRINCIPLED alternative to randomize_joint_angles
+    the user asked for directly: "is there a principled way to start the arm
+    not stretched, in diff locations, not torturous?" — randomize_joint_
+    angles samples each of the 4 arm joints independently in joint space,
+    which CAN produce kinematically-valid but visually awkward/contorted
+    combinations (the "tortuous" look the user flagged after watching the
+    stack2 trial videos) since nothing constrains how the 4 angles compose
+    together physically. This function never touches joint angles directly
+    at all — like randomize_gripper_start (which it's a sibling of, same
+    table-geometry lookup, same "no teleport shortcut for an articulated
+    arm" reasoning), it drives the gripper via the SAME bounded action
+    interface a real policy uses (oracle_action's own direct-proportional-
+    toward-target pattern, not sample_descent_biased_action's noisier
+    exploration-biased random walk — this needs a controller, not an
+    exploration strategy). The resulting joint configuration is whatever
+    the robot's own actuators naturally settle into reaching that point —
+    by construction, this can't produce a pose the real arm wouldn't adopt
+    getting there from its own default, unlike independent joint sampling.
+
+    Unlike randomize_gripper_start (dz forced to 0, LATERAL variation
+    only — which has the exact same "always-the-same-extension, just
+    redirected" flaw already diagnosed and fixed for randomize_joint_angles
+    once, see that function's own docstring), this varies height too: the
+    target point is sampled in XY near the table (within margin of its
+    perimeter, not clear out at arm's length) AND in z (z_range, metres
+    above the table top — 0.05 is "just above the table," 0.35 is clearly
+    elevated), so the resulting poses vary in both compass direction AND
+    reach-extension, not just the former.
+
+    Returns (obs, ok, info) — same shape/contract as randomize_gripper_start.
+    NOT validated yet against the gripper's own workspace limits the way
+    randomize_joint_angles was (20/30-candidate physical-safety check, 10
+    rendered frames) — do that before trusting this for a real collection
+    run, same practice as every other randomization scheme in this project.
+    """
+    import mujoco
+    raw = env.unwrapped
+
+    table_body_id = mujoco.mj_name2id(raw.model, mujoco.mjtObj.mjOBJ_BODY, TABLE_BODY_NAME)
+    table_xy = raw.data.xpos[table_body_id][:2].copy()
+    table_geom_ids = [g for g in range(raw.model.ngeom) if raw.model.geom_bodyid[g] == table_body_id]
+    half_extent = raw.model.geom_size[table_geom_ids[0]][:2].copy()
+    table_top_z = raw.data.xpos[table_body_id][2] + raw.model.geom_size[table_geom_ids[0]][2]
+
+    theta = rng.uniform(0.0, 2.0 * np.pi)
+    r_frac = rng.uniform(0.0, 1.0)   # biased toward the table's own footprint, not just its rim
+    radius_xy = half_extent * r_frac + margin
+    target_xy = table_xy + radius_xy * np.array([np.cos(theta), np.sin(theta)])
+    target_z = table_top_z + rng.uniform(z_range[0], z_range[1])
+    target = np.array([target_xy[0], target_xy[1], target_z])
+
+    done, trunc = False, False
+    for _ in range(n_position_steps):
+        current = obs["observation"][0:3]
+        direction = target - current
+        norm = float(np.linalg.norm(direction)) + 1e-8
+        if norm < 0.01:
+            break
+        scale = min(1.0, norm / pos_scale)
+        action = np.zeros(4, dtype=np.float32)
+        action[:3] = (direction / norm) * scale
+        action[3] = 1.0   # keep fingers open throughout -- this is positioning, not grasping
+        obs, _, done, trunc, _ = env.step(np.clip(action, -1.0, 1.0))
+        if done or trunc:
+            break
+
+    actual = np.array(obs["observation"][0:3])
+    info = {"theta": float(theta), "intended_start": target.copy(), "actual_start": actual}
+    return obs, not (done or trunc), info
+
+
+# The 4 arm joints whose angle actually changes the gripper's reachable pose
+# in a way that PERSISTS (not immediately undone) — the three "roll" joints
+# (upperarm_roll, forearm_roll, wrist_roll) are unlimited/continuous, but
+# _set_action's rot_ctrl is a FIXED orientation commanded every single step,
+# so perturbing them gets pulled back toward that fixed target almost
+# immediately via the mocap weld; they were tried and dropped (2026-10-02).
+# head_pan/head_tilt (camera) and the 3 "slide" joints (always 0, never
+# actuated by any 4D action) are irrelevant to the task and left alone too.
+# Ranges are each joint's own MJCF-declared (jnt_range) limits — read via
+# scripts/-level inspection on 2026-10-02, NOT hardcoded from memory.
+_ARM_POSE_JOINTS = {
+    "robot0:shoulder_pan_joint":  (-1.606, 1.606),
+    "robot0:shoulder_lift_joint": (-1.221, 1.518),
+    "robot0:elbow_flex_joint":    (-2.251, 2.251),
+    "robot0:wrist_flex_joint":    (-2.160, 2.160),
+}
+
+
+def randomize_joint_angles(
+    env, rng, exclude_band: float = 0.35, max_frac: float = 0.85,
+    min_grip_z: float = 0.40, max_retries: int = 30,
+) -> tuple:
+    """
+    Perturbs the arm's own joint angles (not just the gripper's Cartesian
+    position the way randomize_gripper_start does) — every episode in this
+    project starts from the EXACT same joint configuration otherwise (all 4
+    of _ARM_POSE_JOINTS read exactly 0.0 at a fresh env.reset(), confirmed
+    directly via inspection, 2026-10-02), which is a real distributional
+    narrowness: nothing in training/eval has ever seen a different starting
+    arm shape, only different block/target positions.
+
+    Each joint in _ARM_POSE_JOINTS is sampled from
+    ([-max_frac,-exclude_band] union [exclude_band,max_frac]) * its own
+    half-range, CENTERED ON 0.0 (the true default qpos for all four — NOT
+    each joint's own range midpoint, which is nonzero for
+    shoulder_lift_joint since its range (-1.221, 1.518) is asymmetric;
+    centering there was a bug in this function's own first draft and
+    silently produced almost no x-diversity).
+
+    2026-10-03 rewrite: an EARLIER version of this function sampled
+    uniformly in [-scale, +scale] (no excluded band) — confirmed via a
+    direct video review ("i feel like they all start with the arm
+    stretched out") that this produced a demo pool whose starting poses
+    all still looked basically like the same fully-extended default just
+    redirected to a different compass direction, not genuinely varied
+    joint bending. Root cause, verified quantitatively (not just
+    eyeballed): the qpos=0 default IS already a near-fully-extended reach
+    (grip ~1.1m out from the shifted base), and a distribution SYMMETRIC
+    AROUND that center has its expected deviation from center always less
+    than its own range extreme, no matter how wide that extreme is set —
+    widening the old `scale` parameter alone could never fix this, it
+    only changed how far the (still centrally-biased) samples could reach.
+    Excluding the central band forces every single draw genuinely away
+    from the stretched default instead. Confirmed empirically before this
+    became the default: 20/30 random candidates at (exclude_band=0.35,
+    max_frac=0.85) landed physically valid, with resulting gripper reach-
+    from-base spanning 0.12-0.95m and height spanning 0.5-1.6m — true
+    folded-vs-extended, high-vs-low diversity, not just redirected
+    stretch (see the "Pose Generalization & Stacking" artifact's 10-frame
+    comparison).
+
+    Directly setting qpos, like teleport_block, is NOT by itself enough to
+    move the gripper for an ARTICULATED (non-free-floating) body —
+    randomize_gripper_start's own docstring already found this: the
+    mocap-weld tracks wherever reset_mocap2body_xpos last read, so a
+    one-step env.step(zero_action) after mj_forward is required to let the
+    env's own action-application machinery resync the mocap target to the
+    newly-set joint configuration and return a valid, physically-settled
+    obs — same pattern as teleport_block's own caller
+    (init_random_episode) uses after relocating the block.
+
+    Returns (obs, ok) — ok is False if max_retries was exhausted without
+    finding a configuration that settles with grip_z >= min_grip_z and
+    without terminating/truncating on the resync step (same convention as
+    init_random_episode/randomize_gripper_start).
+    """
+    import mujoco
+    raw = env.unwrapped
+
+    joint_info = []
+    for name, (lo, hi) in _ARM_POSE_JOINTS.items():
+        fid = mujoco.mj_name2id(raw.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        joint_info.append((raw.model.jnt_qposadr[fid], raw.model.jnt_dofadr[fid], lo, hi))
+
+    for _ in range(max_retries):
+        for qadr, vadr, lo, hi in joint_info:
+            half_range = max(abs(lo), abs(hi))
+            mag = rng.uniform(exclude_band, max_frac)
+            sign = rng.choice([-1.0, 1.0])
+            raw.data.qpos[qadr] = sign * mag * half_range
+            raw.data.qvel[vadr] = 0.0
+        mujoco.mj_forward(raw.model, raw.data)
+
+        obs, _, done, trunc, _ = env.step(np.zeros(4, dtype=np.float32))
+        grip_z = float(obs["observation"][2])
+        if not (done or trunc) and grip_z >= min_grip_z:
+            return obs, True
+
+    return obs, False

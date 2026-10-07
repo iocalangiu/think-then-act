@@ -383,11 +383,26 @@ def _worker_init_recurrent(env_kwargs: dict) -> None:
     _WORKER_MAX_STEPS_RNN = max_episode_steps
 
 
-def _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size):
+def _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, architecture="mse"):
+    """
+    architecture="mse" (default, preserves every existing caller's
+    behavior unchanged) builds the usual GRU-based SubgoalRecurrentPolicy;
+    "transformer" builds TransformerPolicy instead (added 2026-10-05 for
+    PPO-continuing a transformer BC checkpoint — see that class's own
+    sample()/recompute_log_prob() docstrings for why it's drop-in
+    compatible here despite the different trunk). The critic is ALWAYS
+    the plain GRU value net regardless of actor architecture — same
+    existing convention, PPO's critic is independent of whatever BC
+    architecture the actor came from.
+    """
     from think_then_act.policy.subgoal_recurrent_policy import SubgoalRecurrentPolicy, SubgoalRecurrentValueNetwork
 
-    actor = SubgoalRecurrentPolicy(obs_dim=obs_dim, action_dim=action_dim,
-                                    hidden_dim=hidden_dim, rnn_hidden_size=rnn_hidden_size)
+    if architecture == "transformer":
+        from think_then_act.policy.transformer_policy import TransformerPolicy
+        actor = TransformerPolicy(obs_dim=obs_dim, action_dim=action_dim, d_model=rnn_hidden_size)
+    else:
+        actor = SubgoalRecurrentPolicy(obs_dim=obs_dim, action_dim=action_dim,
+                                        hidden_dim=hidden_dim, rnn_hidden_size=rnn_hidden_size)
     actor.load_state_dict(actor_state)
     actor.eval()
     critic = SubgoalRecurrentValueNetwork(obs_dim=obs_dim, hidden_dim=hidden_dim, rnn_hidden_size=rnn_hidden_size)
@@ -597,6 +612,7 @@ def _worker_init_flat(env_kwargs: dict) -> None:
             randomize_pose_prob=env_kwargs.get("randomize_pose_prob", 1.0),
             pose_exclude_band=env_kwargs.get("pose_exclude_band", 0.35),
             pose_max_frac=env_kwargs.get("pose_max_frac", 0.85),
+            pose_scheme=env_kwargs.get("pose_scheme", "joint_angles"),
             precision_weight=env_kwargs.get("precision_weight", 10.0),
             disturbance_weight=env_kwargs.get("disturbance_weight", 15.0),
         )
@@ -608,7 +624,8 @@ def _worker_init_flat(env_kwargs: dict) -> None:
                            block_resting_z=env_kwargs.get("block_resting_z", 0.425),
                            randomize_pose_prob=env_kwargs.get("randomize_pose_prob", 0.0),
                            pose_exclude_band=env_kwargs.get("pose_exclude_band", 0.35),
-                           pose_max_frac=env_kwargs.get("pose_max_frac", 0.85))
+                           pose_max_frac=env_kwargs.get("pose_max_frac", 0.85),
+                           pose_scheme=env_kwargs.get("pose_scheme", "joint_angles"))
 
     _WORKER_ENV_FLAT       = env
     _WORKER_MAX_STEPS_FLAT = max_episode_steps
@@ -680,16 +697,16 @@ def _run_episode_flat(actor, critic, seed: int) -> dict:
 
 
 def _collect_one_flat(task: tuple) -> dict:
-    actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, seed = task
-    actor, critic = _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size)
+    actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, seed, architecture = task
+    actor, critic = _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, architecture)
     return _run_episode_flat(actor, critic, seed)
 
 
 def collect_serial_flat(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size,
-                         seeds: list, env_kwargs: dict) -> list:
+                         seeds: list, env_kwargs: dict, architecture: str = "mse") -> list:
     if _WORKER_ENV_FLAT is None:
         _worker_init_flat(env_kwargs)
-    actor, critic = _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size)
+    actor, critic = _build_models_recurrent(actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, architecture)
     return [_run_episode_flat(actor, critic, seed) for seed in seeds]
 
 
@@ -700,9 +717,9 @@ def make_pool_flat(env_kwargs: dict, n_workers: int):
 
 
 def collect_with_pool_flat(pool, actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size,
-                            seeds: list) -> list:
+                            seeds: list, architecture: str = "mse") -> list:
     tasks = [
-        (actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, seed)
+        (actor_state, critic_state, obs_dim, action_dim, hidden_dim, rnn_hidden_size, seed, architecture)
         for seed in seeds
     ]
     return pool.map(_collect_one_flat, tasks)

@@ -50,6 +50,8 @@ class FlatTaskPPOConfig:
         randomize_pose_prob: float = 0.0,
         pose_exclude_band: float = 0.35,
         pose_max_frac: float = 0.85,
+        pose_scheme: str = "joint_angles",   # "joint_angles" (default) or "gripper_3d" --
+                                  # see FlatTaskEnv's own docstring, 2026-10-04
         env_variant: str = "single",   # "single" (FlatTaskEnv, default -- every existing
                                   # caller/checkpoint is unaffected) or "multicube"
                                   # (MultiCubeStackEnv, training/multicube_stack_env.py)
@@ -57,6 +59,11 @@ class FlatTaskPPOConfig:
         max_cubes: int = 3,
         precision_weight: float = 10.0,
         disturbance_weight: float = 15.0,
+        bc_replay_lr: float = 1e-4,
+        architecture: str = "mse",   # "mse" (default, SubgoalRecurrentPolicy -- every existing
+                                  # checkpoint/caller unaffected) or "transformer"
+                                  # (TransformerPolicy) -- see rollout_workers.py's
+                                  # _build_models_recurrent, 2026-10-05.
     ) -> None:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -79,11 +86,14 @@ class FlatTaskPPOConfig:
         self.randomize_pose_prob = randomize_pose_prob
         self.pose_exclude_band = pose_exclude_band
         self.pose_max_frac = pose_max_frac
+        self.pose_scheme = pose_scheme
         self.env_variant = env_variant
         self.min_cubes = min_cubes
         self.max_cubes = max_cubes
         self.precision_weight = precision_weight
         self.disturbance_weight = disturbance_weight
+        self.bc_replay_lr = bc_replay_lr
+        self.architecture = architecture
 
     def as_dict(self) -> dict:
         return {k: v for k, v in vars(self).items()}
@@ -96,6 +106,7 @@ class FlatTaskPPOConfig:
             "randomize_pose_prob": self.randomize_pose_prob,
             "pose_exclude_band": self.pose_exclude_band,
             "pose_max_frac": self.pose_max_frac,
+            "pose_scheme": self.pose_scheme,
             "env_variant": self.env_variant,
             "min_cubes": self.min_cubes,
             "max_cubes": self.max_cubes,
@@ -117,10 +128,17 @@ class FlatTaskPPOTrainer:
             SubgoalRecurrentPolicy, SubgoalRecurrentValueNetwork,
         )
 
-        self.actor = SubgoalRecurrentPolicy(
-            obs_dim=self.config.obs_dim, action_dim=self.config.action_dim,
-            hidden_dim=self.config.hidden_dim, rnn_hidden_size=self.config.rnn_hidden_size,
-        )
+        if self.config.architecture == "transformer":
+            from think_then_act.policy.transformer_policy import TransformerPolicy
+            self.actor = TransformerPolicy(
+                obs_dim=self.config.obs_dim, action_dim=self.config.action_dim,
+                d_model=self.config.rnn_hidden_size,
+            )
+        else:
+            self.actor = SubgoalRecurrentPolicy(
+                obs_dim=self.config.obs_dim, action_dim=self.config.action_dim,
+                hidden_dim=self.config.hidden_dim, rnn_hidden_size=self.config.rnn_hidden_size,
+            )
         self.critic = SubgoalRecurrentValueNetwork(
             obs_dim=self.config.obs_dim, hidden_dim=self.config.hidden_dim,
             rnn_hidden_size=self.config.rnn_hidden_size,
@@ -130,6 +148,12 @@ class FlatTaskPPOTrainer:
             lr=self.config.lr,
         )
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.config.lr)
+        # Separate optimizer for bc_replay_step -- deliberately NOT sharing
+        # self.optimizer (which also steps the critic on every PPO update)
+        # so this auxiliary self-imitation update's effective step size
+        # isn't coupled to whatever lr the PPO side is tuned to. See
+        # bc_replay_step's own docstring for why this method exists.
+        self.bc_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.config.bc_replay_lr)
 
     # ------------------------------------------------------------------
     def _ensure_pool(self, env_kwargs: dict):
@@ -159,14 +183,14 @@ class FlatTaskPPOTrainer:
             return rollout_workers.collect_serial_flat(
                 actor_state, critic_state,
                 self.config.obs_dim, self.config.action_dim, self.config.hidden_dim, self.config.rnn_hidden_size,
-                seeds, env_kwargs,
+                seeds, env_kwargs, architecture=self.config.architecture,
             )
 
         pool = self._ensure_pool(env_kwargs)
         return rollout_workers.collect_with_pool_flat(
             pool, actor_state, critic_state,
             self.config.obs_dim, self.config.action_dim, self.config.hidden_dim, self.config.rnn_hidden_size,
-            seeds,
+            seeds, architecture=self.config.architecture,
         )
 
     # ------------------------------------------------------------------
@@ -227,6 +251,80 @@ class FlatTaskPPOTrainer:
                 value_losses.append(float(value_loss.item()))
 
         return {"value_loss": float(np.mean(value_losses))}
+
+    # ------------------------------------------------------------------
+    # Self-imitation / experience-replay auxiliary update — added 2026-10-05
+    # after raw PPO-for-2-cubes (warm-started from a weak checkpoint,
+    # no replay) showed real, sustained collapse and the subsequent
+    # from-scratch/fine-tune BC comparisons established that successes are
+    # genuinely rare+valuable here (demo-harvest hit rates in the 19-47%
+    # range, not near-100%). On-policy PPO weighs a batch's few successes
+    # by however much of that batch's own advantage signal they happen to
+    # carry — if a sparse-success iteration's successes are outnumbered by
+    # failures, the gradient can still net out AWAY from the behavior that
+    # worked. This directly re-emphasizes genuine successes via an
+    # independent supervised (BC-style) regression step, regardless of how
+    # the current iteration's on-policy batch happened to land. See memory:
+    # flat_policy_ppo_generalization's 2026-10-05 entry for the fine-tune-
+    # vs-alternation precedent this generalizes (warm-start + direct
+    # imitation on successes beat relearning everything from mixed data).
+    # ------------------------------------------------------------------
+    def bc_replay_step(self, replay_episodes: list, episodes_per_minibatch: int = None) -> dict:
+        """
+        Masked MSE regression of the actor toward replay_episodes'
+        "teacher_action" (bounded, tanh-space — same convention
+        flat_bc_multi_head.py's "mse" head regresses toward: predicted =
+        tanh(mean)). Uses self.bc_optimizer (actor-only, its own lr), NOT
+        self.optimizer — this is a separate auxiliary update, not part of
+        the PPO clipped-surrogate step. Silently no-ops (returns
+        bc_replay_loss=None) if the replay buffer is empty, which is
+        expected on the very first iterations before any seed demos or
+        on-policy successes exist yet.
+        """
+        import torch
+
+        if not replay_episodes:
+            return {"bc_replay_loss": None}
+
+        batch_size = episodes_per_minibatch or self.config.episodes_per_minibatch
+        episodes = [
+            {"obs": np.asarray(d["obs"], dtype=np.float32),
+             "action": np.asarray(d["teacher_action"], dtype=np.float32),
+             "T": len(d["obs"])}
+            for d in replay_episodes
+        ]
+
+        perm = torch.randperm(len(episodes))
+        losses = []
+        for start in range(0, len(episodes), batch_size):
+            idx = perm[start:start + batch_size]
+            batch = [episodes[i] for i in idx.tolist()]
+            T_max = max(ep["T"] for ep in batch)
+            B = len(batch)
+
+            obs_batch = torch.zeros(B, T_max, self.config.obs_dim)
+            action_batch = torch.zeros(B, T_max, self.config.action_dim)
+            mask = torch.zeros(B, T_max)
+            for b, ep in enumerate(batch):
+                T = ep["T"]
+                obs_batch[b, :T] = torch.from_numpy(ep["obs"])
+                action_batch[b, :T] = torch.from_numpy(ep["action"])
+                mask[b, :T] = 1.0
+
+            hidden_state = torch.zeros(1, B, self.config.rnn_hidden_size)
+            mean, _, _ = self.actor.forward(obs_batch, hidden_state)
+            predicted = torch.tanh(mean)
+            per_step = ((predicted - action_batch) ** 2).sum(dim=-1)
+            mask_sum = mask.sum().clamp(min=1.0)
+            loss = (mask * per_step).sum() / mask_sum
+
+            self.bc_optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
+            self.bc_optimizer.step()
+            losses.append(float(loss.item()))
+
+        return {"bc_replay_loss": float(np.mean(losses))}
 
     # ------------------------------------------------------------------
     def _compute_masked_losses(self, obs_batch, raw_batch, old_lp_batch, adv_batch, ret_batch, mask, clip_eps: float) -> dict:

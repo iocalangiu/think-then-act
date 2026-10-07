@@ -17,7 +17,7 @@ machinery instead of eval_stack_ppo's plain-env one, so this number is
 directly comparable to that 76.7% baseline.
 
 Run with:
-    modal run scripts/eval_multicube_by_cube_count.py --ckpt-path checkpoints/multicube_stack_ppo_v1_best.pt
+    modal run scripts/multi-cube-experiment/eval_multicube_by_cube_count.py --ckpt-path checkpoints/multicube_stack_ppo_v1_best.pt
 """
 
 import modal

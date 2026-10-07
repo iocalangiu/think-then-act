@@ -166,6 +166,9 @@ def diagnose(
                 ever_lifted_and_gripped = True
             table_contact = gripper_table_contact(env)
             gap = mocap_gap(env)
+            d_block_target = float(np.linalg.norm(
+                np.asarray(obs["desired_goal"], dtype=np.float64) - np.asarray(obs["achieved_goal"], dtype=np.float64)
+            ))
 
             trace.append({
                 "t": t, "action": [round(float(a), 3) for a in action],
@@ -175,6 +178,7 @@ def diagnose(
                 "table_contact": table_contact,
                 "mocap_gap_z": round(gap, 5),
                 "height_above_resting": round(height_above_resting, 4),
+                "d_block_target": round(d_block_target, 4),
             })
 
             if info.get("is_success", False):
@@ -209,7 +213,7 @@ def diagnose(
                           f"block_xy_delta={row['block_xy_delta']}  "
                           f"contact(L/R)={row['left_force']}/{row['right_force']}  "
                           f"gripper_table_contact={row['table_contact']}  mocap_gap_z={row['mocap_gap_z']}  "
-                          f"height={row['height_above_resting']}",
+                          f"height={row['height_above_resting']}  d_block_target={row['d_block_target']}",
                           flush=True)
 
     env.close()

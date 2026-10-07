@@ -24,5 +24,20 @@ wandb/
 *.png
 *.jpg
 
+# Downloaded rollout videos, diagnostic logs, seed analysis reports —
+# anything pulled from the Modal volume via `modal volume get`.
+artifacts/
+
+# ...except assets/ — deliberately-curated media (e.g. README demo GIFs),
+# not raw pulled artifacts, so it's exempt from the video/image rules above.
+# "!assets/**" (not just "!assets/") because those rules match by file
+# EXTENSION regardless of directory, not by directory — negating only the
+# directory itself doesn't re-include files a broader pattern already
+# excludes; the negation has to target the same files directly.
+!assets/**
+
 # macOS
 .DS_Store
+
+# Personal/internal notes, not for the public repo
+TEACHER_MODEL_PROPOSAL.md

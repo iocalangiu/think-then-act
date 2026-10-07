@@ -9,10 +9,18 @@ SkillEnv implements, but driven manually here so every frame AND the VLM's
 think/action text at each decision boundary can be captured together, for a
 synced video+transcript demo (see memory: hierarchical_architecture.md).
 
-ONLY covers the subgoals with a trained low-level policy so far
-(align_xy/descend/close_gripper, per memory 2026-07-16) — lift/
-move_to_target/release have no skill to execute yet, so if the VLM picks one
-of those the rollout stops there rather than pretending to run it.
+Covers whichever subgoals are passed via `subgoals` (default
+align_xy/descend/close_gripper, per memory 2026-07-16) — if the VLM picks
+one not in that set, the rollout stops there rather than pretending to run
+it. Pass `use_perception=False` to drive skills off ground-truth
+achieved_goal instead of the pose/collision models (isolates the demo from
+the separate, still-open pose-model-noise question — see bugs_and_fixes
+memory). Pass `scripted_close_lift_tail=True` to append a deterministic,
+non-VLM close+lift proof (env/oracle.py's own GRASP->CARRY logic) right
+after the VLM hands off to a subgoal NOT in `subgoals` (e.g. `subgoals=
+"align_xy"` — the VLM picks close_gripper next, which isn't loaded, and
+that handoff triggers the scripted proof) — instead of relying on
+close_gripper's own trained policy.
 
 Saves (both on the model volume, under /model-cache/demo/), once per seed:
     subgoal_demo_{seed}.mp4         — the full rollout, every base-env frame
@@ -74,15 +82,115 @@ def _run_skill_recording(skill, base_env, obs, frames: list) -> tuple:
     return obs, False, False, False, info
 
 
-def run_demo_rollout(vlm_policy, skills: dict, base_env, seed: int, max_skill_calls: int) -> tuple:
+def _run_scripted_close_lift(base_env, obs, frames: list, max_steps: int) -> tuple:
+    """
+    Deterministic, non-VLM, non-RL proof that the preceding skill call (e.g.
+    align_xy) actually left the gripper positioned to grasp — NOT a demo of
+    close_gripper's own trained policy (which has known unresolved issues
+    at small finger widths, see bugs_and_fixes memory) and not a new
+    scripted sequence invented for this script. Reuses env/oracle.py's own
+    GRASP branch verbatim (hold position + close fingers, then — once
+    fingers are actually closed — lift) — the same proven heuristic this
+    project already trusts for SFT data generation and per-subgoal episode
+    setup — rather than hand-rolling a second close+lift sequence that
+    could quietly drift out of sync with it.
+
+    Returns (obs, summary_entry). summary_entry["lift_start_frame_index"]
+    marks the frame where the scripted motion switches from closing to
+    lifting — oracle_action's `phase` string alone can't tell these apart
+    (both are "GRASP"; it only flips to "CARRY" once the block has already
+    risen partway through the lift), so this is inferred from the action's
+    own dz component instead, for callers (e.g. a demo UI's label track)
+    that want to highlight "close_gripper" vs "lift" as separate segments.
+    """
+    from think_then_act.env.oracle import oracle_action
+
+    block_z_start = float(obs["achieved_goal"][2])
+    grip_z_start  = float(obs["observation"][2])
+    carrying = False
+    phase = None
+    lift_start_frame_index = None
+    for _ in range(max_steps):
+        action, phase, carrying = oracle_action(
+            obs["observation"], obs["achieved_goal"], obs["desired_goal"], carrying=carrying,
+        )
+        # GRASP's "close" sub-branch commands zero xyz motion; its "lift"
+        # sub-branch commands full +dz — a clean signal to split on, well
+        # before `phase` itself would ever say so.
+        is_lift_step = float(action[2]) > 0.3
+        obs, _, terminated, truncated, info = base_env.step(action)
+        frames.append(base_env.last_frame())
+        if is_lift_step and lift_start_frame_index is None:
+            lift_start_frame_index = len(frames) - 1
+        if terminated or truncated or phase == "CARRY":
+            break
+
+    block_rise = float(obs["achieved_goal"][2]) - block_z_start
+    grip_rise  = float(obs["observation"][2]) - grip_z_start
+    entry = {
+        "subgoal"       : "scripted_close_lift",
+        "scripted"      : True,
+        "think"         : (
+            "(scripted, not the VLM or a trained low-level policy) closed the "
+            "fingers and lifted using env/oracle.py's own GRASP->CARRY logic, "
+            "to verify the preceding skill call actually left the gripper "
+            "positioned to grasp."
+        ),
+        "phase_reached"         : phase,
+        "lift_start_frame_index": lift_start_frame_index,
+        "block_rise_m"          : round(block_rise, 5),
+        "grip_rise_m"           : round(grip_rise, 5),
+        # CARRY requires oracle.py's own is_grasped check (block lifted AND
+        # close to the gripper) -- a real physical grasp, not just closed
+        # fingers near the block. See oracle_action's docstring.
+        "grasp_verified": bool(phase == "CARRY" and block_rise > 0.01),
+    }
+    return obs, entry
+
+
+def run_demo_rollout(vlm_policy, skills: dict, base_env, seed: int, max_skill_calls: int,
+                      scripted_close_lift_tail: bool = False,
+                      scripted_close_lift_max_steps: int = 25,
+                      init_subgoal: str | None = None, align_xy_policy=None) -> tuple:
+    import time
     import numpy as np
-    from think_then_act.env.setup import init_random_episode
+    from think_then_act.env.setup import (
+        init_random_episode, init_episode_before_subgoal, randomize_gripper_start,
+    )
 
     rng = np.random.default_rng(seed)
     base_env.reset()
-    obs, ok = init_random_episode(base_env, rng)
+    if init_subgoal == "hover_above_block":
+        # A genuine "xy-aligned, still elevated" frame -- NOT the same as
+        # init_subgoal="descend" below, which runs align_xy's OWN trained
+        # policy to ITS done condition and (per its reward's z-penalty
+        # side effect) ends up already near grasp height, so it can never
+        # actually produce this state. Here the gripper is driven laterally
+        # (bounded action steps, dz held at 0 throughout -- the only proven
+        # way to relocate it, see randomize_gripper_start's docstring)
+        # directly above the block's xy, leaving z untouched at its fresh-
+        # reset height. Lets a demo show what the VLM says when descend is
+        # actually the right call, not structurally pre-empted by align_xy.
+        obs, ok = init_random_episode(base_env, rng)
+        if ok:
+            obs, ok, _info = randomize_gripper_start(
+                base_env, rng, obs, target_xy=obs["achieved_goal"][:2], xy_bias_strength=1.0,
+            )
+    elif init_subgoal:
+        # Starts the episode already in the canonical state that subgoal's
+        # OWN low-level training/eval uses (env/setup.py's own setup logic,
+        # not a second implementation here) -- e.g. init_subgoal="descend"
+        # runs align_xy_policy (scripted, not the VLM) to align_xy's own
+        # done condition, so the demo starts with the gripper already
+        # above the block, to see what the VLM says from THAT state rather
+        # than always starting from a fresh reset.
+        obs, ok = init_episode_before_subgoal(
+            base_env, rng, subgoal=init_subgoal, align_xy_policy=align_xy_policy
+        )
+    else:
+        obs, ok = init_random_episode(base_env, rng)
     if not ok:
-        raise RuntimeError(f"init_random_episode failed for seed={seed}")
+        raise RuntimeError(f"init_{init_subgoal or 'random'}_episode failed for seed={seed}")
 
     frames    = [base_env.last_frame()]
     transcript = []
@@ -93,9 +201,16 @@ def run_demo_rollout(vlm_policy, skills: dict, base_env, seed: int, max_skill_ca
             "achieved_goal": obs["achieved_goal"],
             "desired_goal" : obs["desired_goal"],
         }
+        # Wall-clock time for this ONE VLM decision (prompt build + Qwen2-VL
+        # generate() + parse), on the actual A10G this project trains on —
+        # not a synthetic/estimated number. First call in a batch includes
+        # any lazy CUDA-kernel warmup, so it isn't representative of steady
+        # state; callers/consumers should treat call_index==0 accordingly.
+        t0 = time.perf_counter()
         raw_response, subgoal, think, think_found, action_found = vlm_policy.act(
             frames[-1], state_entry
         )
+        decision_latency_s = time.perf_counter() - t0
 
         entry = {
             "call_index" : call_index,
@@ -103,6 +218,7 @@ def run_demo_rollout(vlm_policy, skills: dict, base_env, seed: int, max_skill_ca
             "think"      : think,
             "subgoal"    : subgoal,
             "raw_response": raw_response,
+            "decision_latency_s": round(decision_latency_s, 3),
         }
 
         if subgoal is None:
@@ -112,6 +228,28 @@ def run_demo_rollout(vlm_policy, skills: dict, base_env, seed: int, max_skill_ca
         if subgoal not in skills:
             entry["stop_reason"] = f"chose {subgoal!r}, which has no trained low-level policy yet"
             transcript.append(entry)
+            # The VLM's decision to move on IS the real "handoff" moment --
+            # append it to the transcript/think-trace like any other
+            # decision (a demo UI wants to show this reasoning), then prove
+            # the PRECEDING skill call actually left the gripper ready,
+            # scripted -- but only if that preceding call actually
+            # succeeded; a failed skill has nothing real to verify. EXCEPT
+            # under init_subgoal="hover_above_block": there IS no preceding
+            # skill call when the VLM's very first decision is already
+            # "not in skills" -- run the scripted probe anyway so a WRONG
+            # first call (e.g. "close_gripper" while still 30cm up) shows
+            # its real physical consequence rather than just stopping
+            # silently. This is deliberately a "what actually happens"
+            # demonstration here, not a success-precondition check.
+            precondition_ok = len(transcript) >= 2 and transcript[-2].get("skill_success")
+            show_consequence_anyway = len(transcript) == 1 and init_subgoal == "hover_above_block"
+            if scripted_close_lift_tail and (precondition_ok or show_consequence_anyway):
+                obs, scripted_entry = _run_scripted_close_lift(
+                    base_env, obs, frames, scripted_close_lift_max_steps
+                )
+                scripted_entry["call_index"]  = len(transcript)
+                scripted_entry["frame_index"] = len(frames) - 1
+                transcript.append(scripted_entry)
             break
 
         transcript.append(entry)
@@ -136,16 +274,23 @@ def run_demo_rollout(vlm_policy, skills: dict, base_env, seed: int, max_skill_ca
 # ---------------------------------------------------------------------------
 
 def _record_one_seed(seed, vlm_policy, skills, max_skill_calls, max_steps_per_skill,
-                      fps, out_dir, gym, ObservationHarness, setup_env, save_video, Image):
+                      fps, out_dir, gym, ObservationHarness, setup_env, save_video, Image,
+                      scripted_close_lift_tail=False, scripted_close_lift_max_steps=25,
+                      init_subgoal=None, align_xy_policy=None):
     import os, json
 
     base_env = ObservationHarness(
         gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
-                  max_episode_steps=max_skill_calls * max_steps_per_skill + 50)
+                  max_episode_steps=max_skill_calls * max_steps_per_skill + scripted_close_lift_max_steps + 50)
     )
     setup_env(base_env)
 
-    frames, transcript = run_demo_rollout(vlm_policy, skills, base_env, seed, max_skill_calls)
+    frames, transcript = run_demo_rollout(
+        vlm_policy, skills, base_env, seed, max_skill_calls,
+        scripted_close_lift_tail=scripted_close_lift_tail,
+        scripted_close_lift_max_steps=scripted_close_lift_max_steps,
+        init_subgoal=init_subgoal, align_xy_policy=align_xy_policy,
+    )
     base_env.close()
 
     frames_dir = os.path.join(out_dir, f"subgoal_demo_{seed}_frames")
@@ -218,6 +363,11 @@ def record_subgoal_demo(
     fps: int = 10,
     algo: str = "ppo",
     use_best: bool = False,
+    subgoals: str = "align_xy,descend,close_gripper",
+    use_perception: bool = True,
+    scripted_close_lift_tail: bool = False,
+    scripted_close_lift_max_steps: int = 25,
+    init_subgoal: str = "",
 ) -> dict:
     import os, json
     import torch
@@ -236,7 +386,7 @@ def record_subgoal_demo(
     from think_then_act.policy.subgoal_vlm_policy import SubgoalVLMPolicy
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.fetch_skills import build_fetch_skills
-    from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
 
     seed_list = [int(s) for s in seeds.split(",") if s.strip() != ""]
 
@@ -246,35 +396,45 @@ def record_subgoal_demo(
 
     ckpt_dir = os.path.join(MODEL_CACHE_DIR, "checkpoints")
 
+    # use_perception=False drives the low-level skills off ground-truth
+    # achieved_goal (no pose/collision model) -- matches the exact config
+    # eval_align_descend_convergence.py used to confirm align_xy=90%/
+    # descend=100% standalone completion, isolating the demo from the
+    # separate, still-open pose-model-noise question (see hierarchical_
+    # architecture / bugs_and_fixes memory: an align_xy precision retrain
+    # aimed at that had an unconfirmed final outcome).
     collision_model = None
-    collision_ckpt = os.path.join(ckpt_dir, "collision_predictor.pt")
-    if os.path.exists(collision_ckpt):
-        collision_model = CollisionPredictor()
-        collision_model.load_state_dict(torch.load(collision_ckpt, map_location="cpu"))
-        collision_model.eval()
-        print(f"  collision model   <- {collision_ckpt}")
-
-    # Optional block pose predictor — same as train_low_level_ppo.py; every
-    # skill's build_obs uses its estimate instead of the privileged
-    # achieved_goal when present (reward/done inside each skill's execution
-    # loop stay on ground truth regardless — see block_pose_predictor.py).
     pose_model = None
-    pose_ckpt = os.path.join(ckpt_dir, "block_pose_predictor.pt")
-    if os.path.exists(pose_ckpt):
-        pose_model = BlockPosePredictor()
-        pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
-        pose_model.eval()
-        print(f"  pose model        <- {pose_ckpt}")
+    if use_perception:
+        collision_ckpt = os.path.join(ckpt_dir, "collision_predictor.pt")
+        if os.path.exists(collision_ckpt):
+            collision_model = CollisionPredictor()
+            collision_model.load_state_dict(torch.load(collision_ckpt, map_location="cpu"))
+            collision_model.eval()
+            print(f"  collision model   <- {collision_ckpt}")
 
-    # Only the subgoals with a trained low-level policy so far (per
-    # hierarchical_architecture memory, 2026-07-16) — lift/move_to_target/
-    # release have no skill to execute yet, so the rollout stops if the VLM
-    # ever picks one of those (see run_demo_rollout's "not in skills" check).
-    trained_subgoals = ("align_xy", "descend", "close_gripper")
+        pose_ckpt = os.path.join(ckpt_dir, "block_pose_predictor.pt")
+        if os.path.exists(pose_ckpt):
+            pose_model = BlockPosePredictor()
+            pose_model.load_state_dict(torch.load(pose_ckpt, map_location="cpu"))
+            pose_model.eval()
+            print(f"  pose model        <- {pose_ckpt}")
+    else:
+        print(f"  use_perception=False -- skills driven by ground-truth achieved_goal, "
+              f"no pose/collision model loaded")
+
+    # Which subgoals the VLM is offered / has a trained low-level policy
+    # loaded for -- caller-controlled so a demo can be deliberately narrowed
+    # (e.g. "align_xy,descend" to exclude close_gripper's own known small-
+    # width issues and instead prove descend worked via a scripted tail;
+    # see run_demo_rollout's scripted_close_lift_tail). If the VLM picks
+    # a subgoal NOT in this set, the rollout stops there rather than
+    # pretending to run it (see run_demo_rollout's "not in skills" check).
+    trained_subgoals = tuple(s.strip() for s in subgoals.split(",") if s.strip())
     policies = {}
     for subgoal in trained_subgoals:
         ckpt = resolve_subgoal_checkpoint(ckpt_dir, subgoal, algo=algo, use_best=use_best)
-        policies[subgoal] = _load_actor(ckpt, obs_dim=SUBGOAL_OBS_DIM)
+        policies[subgoal] = _load_actor(ckpt, obs_dim=obs_dim_for_subgoal(subgoal))
         print(f"  {subgoal:14s}    <- {ckpt}")
 
     skills = build_fetch_skills(policies, collision_model, pose_model, max_steps=max_steps_per_skill)
@@ -289,11 +449,25 @@ def record_subgoal_demo(
     out_dir = os.path.join(MODEL_CACHE_DIR, "demo")
     os.makedirs(out_dir, exist_ok=True)
 
+    init_subgoal = init_subgoal.strip() or None
+    # Per init_episode_before_subgoal: "descend" setup runs align_xy's own
+    # trained actor (scripted, not the VLM) to align_xy's done condition --
+    # every other subgoal's setup uses env/oracle.py's scripted heuristic
+    # directly and needs no actor at all.
+    if init_subgoal == "descend" and "align_xy" not in policies:
+        raise ValueError(
+            "init_subgoal='descend' needs align_xy's actor loaded for setup "
+            f"(add align_xy to --subgoals) -- currently loaded: {list(policies)}"
+        )
+
     results = {}
     for seed in seed_list:
         results[seed] = _record_one_seed(
             seed, vlm_policy, skills, max_skill_calls, max_steps_per_skill,
             fps, out_dir, gym, ObservationHarness, setup_env, save_video, Image,
+            scripted_close_lift_tail=scripted_close_lift_tail,
+            scripted_close_lift_max_steps=scripted_close_lift_max_steps,
+            init_subgoal=init_subgoal, align_xy_policy=policies.get("align_xy"),
         )
 
     # Index across the whole batch — which seeds are worth opening in
@@ -336,12 +510,21 @@ def record_subgoal_demo(
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main(seeds: str = "0", max_skill_calls: int = 10):
+def main(seeds: str = "0", max_skill_calls: int = 10, algo: str = "ppo", use_best: bool = False,
+         subgoals: str = "align_xy,descend,close_gripper", use_perception: bool = True,
+         scripted_close_lift_tail: bool = False, scripted_close_lift_max_steps: int = 25,
+         init_subgoal: str = "", max_steps_per_skill: int = 30):
     # .spawn(), not .remote() -- see eval_subgoal_vlm.py's local entrypoint
     # comment: .remote() blocks on the CLI's connection, so under
     # `modal run --detach` the call gets cancelled the moment the CLI exits
     # after dispatch. .spawn() is fire-and-forget and survives that.
-    handle = record_subgoal_demo.spawn(seeds=seeds, max_skill_calls=max_skill_calls)
+    handle = record_subgoal_demo.spawn(
+        seeds=seeds, max_skill_calls=max_skill_calls, algo=algo, use_best=use_best,
+        subgoals=subgoals, use_perception=use_perception,
+        scripted_close_lift_tail=scripted_close_lift_tail,
+        scripted_close_lift_max_steps=scripted_close_lift_max_steps,
+        init_subgoal=init_subgoal, max_steps_per_skill=max_steps_per_skill,
+    )
     print(f"\nJob spawned. Function call ID: {handle.object_id}")
     print(f"Monitor at https://modal.com")
     print(f"\nDownload when finished (batch summary first, to triage which seeds to look at):")

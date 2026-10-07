@@ -111,12 +111,15 @@ def train_bc_multicube_alternating(
 
 @app.local_entrypoint()
 def main(
+    single_cube_demos_path: str = "demonstrations/sb3_teacher_full_task_joint_randomized_v2.pkl",
+    multicube_demos_path: str = "demonstrations/multicube_genuine_demos.pkl",
     multicube_oversample: int = 2,
     n_epochs: int = 20,
     lr: float = 1e-3,
     out_ckpt_path: str = "checkpoints/bc_multicube_alternating_v1.pt",
 ):
     result = train_bc_multicube_alternating.remote(
+        single_cube_demos_path=single_cube_demos_path, multicube_demos_path=multicube_demos_path,
         multicube_oversample=multicube_oversample, n_epochs=n_epochs, lr=lr, out_ckpt_path=out_ckpt_path,
     )
     print("\n", result)

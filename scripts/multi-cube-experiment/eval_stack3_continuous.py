@@ -20,7 +20,7 @@ fine-tuned checkpoint, so any difference is attributable to the fine-tune
 and not to some property of the continuous-episode protocol itself.
 
 Run with:
-    modal run scripts/eval_stack3_continuous.py
+    modal run scripts/multi-cube-experiment/eval_stack3_continuous.py
 """
 
 import modal

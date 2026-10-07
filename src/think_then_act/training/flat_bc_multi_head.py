@@ -62,7 +62,7 @@ class MultiHeadBCConfig:
         return {k: v for k, v in vars(self).items()}
 
 
-_VALID_POLICY_TYPES = ("mse", "mdn", "autoregressive", "factored", "cvae")
+_VALID_POLICY_TYPES = ("mse", "mdn", "autoregressive", "factored", "cvae", "transformer", "diffusion")
 
 
 class MultiHeadBCTrainer:
@@ -77,11 +77,22 @@ class MultiHeadBCTrainer:
         from think_then_act.policy.subgoal_recurrent_policy import (
             SubgoalRecurrentPolicy, SubgoalRecurrentValueNetwork,
         )
-        from think_then_act.policy.flat_bc_heads import MDNPolicy, AutoregressiveDiscretePolicy, CVAEPolicy
+        from think_then_act.policy.flat_bc_heads import MDNPolicy, AutoregressiveDiscretePolicy, CVAEPolicy, DiffusionPolicy
+        from think_then_act.policy.transformer_policy import TransformerPolicy
 
         c = self.config
         if c.policy_type == "mse":
             self.actor = SubgoalRecurrentPolicy(
+                obs_dim=c.obs_dim, action_dim=c.action_dim,
+                hidden_dim=c.hidden_dim, rnn_hidden_size=c.rnn_hidden_size,
+            )
+        elif c.policy_type == "transformer":
+            self.actor = TransformerPolicy(
+                obs_dim=c.obs_dim, action_dim=c.action_dim,
+                d_model=c.rnn_hidden_size, max_seq_len=320,
+            )
+        elif c.policy_type == "diffusion":
+            self.actor = DiffusionPolicy(
                 obs_dim=c.obs_dim, action_dim=c.action_dim,
                 hidden_dim=c.hidden_dim, rnn_hidden_size=c.rnn_hidden_size,
             )
@@ -125,10 +136,17 @@ class MultiHeadBCTrainer:
 
         extra_loss = obs_batch.new_zeros(())
 
-        if c.policy_type == "mse":
+        if c.policy_type in ("mse", "transformer"):
+            # TransformerPolicy.forward() IGNORES hidden_state entirely (it
+            # processes the whole (B, T, obs_dim) chunk via self-attention
+            # in one shot) -- passing the same GRU-shaped zero tensor mse
+            # uses is harmless, just discarded. See transformer_policy.py's
+            # own docstring for why this makes it a safe drop-in here.
             mean, _, _ = self.actor.forward(obs_batch, hidden_state)
             predicted = torch.tanh(mean)
             per_step = ((predicted - action_batch) ** 2).sum(dim=-1)
+        elif c.policy_type == "diffusion":
+            per_step, _ = self.actor.diffusion_loss(obs_batch, action_batch, hidden_state)
         elif c.policy_type == "mdn":
             per_step, _ = self.actor.nll_loss(obs_batch, action_batch, hidden_state)
             if c.mdn_smoothness_weight > 0:
@@ -209,6 +227,58 @@ class MultiHeadBCTrainer:
             epoch_losses.append(float(np.mean(batch_losses)))
 
         return {"epoch_losses": epoch_losses}
+
+    def evaluate(self, demonstrations: list, episodes_per_minibatch: int | None = None) -> float:
+        """
+        Held-out loss on `demonstrations`, under torch.no_grad() — no
+        optimizer step, no weight update. Same masked-minibatch batching as
+        fit(), just without the backward pass. Added 2026-10-05 after
+        noticing every BC run this project has reported was TRAINING loss
+        only (no val split existed anywhere in this module) — a training
+        loss can drop while real rollout performance gets worse (seen
+        directly: the stack2 600-demo fine-tune's training loss was LOWER
+        than the 400-demo one, 0.055 vs 0.083, while its rollout success
+        rate was much worse, 16.7% vs 46.7% — exactly the overfit/noisy-
+        data signature a held-out loss is meant to catch early, cheaply,
+        before paying for a full rollout eval).
+        """
+        import torch
+
+        if not demonstrations:
+            raise ValueError("evaluate() called with zero demonstrations.")
+
+        c = self.config
+        batch_size = episodes_per_minibatch or c.episodes_per_minibatch
+        episodes = [
+            {"obs": np.asarray(d["obs"], dtype=np.float32),
+             "action": np.asarray(d["teacher_action"], dtype=np.float32),
+             "weight": float(d.get("weight", 1.0)),
+             "T": len(d["obs"])}
+            for d in demonstrations
+        ]
+
+        total_loss = 0.0
+        n_batches = 0
+        with torch.no_grad():
+            for start in range(0, len(episodes), batch_size):
+                batch = episodes[start:start + batch_size]
+                T_max = max(ep["T"] for ep in batch)
+                B = len(batch)
+
+                obs_batch = torch.zeros(B, T_max, c.obs_dim)
+                action_batch = torch.zeros(B, T_max, c.action_dim)
+                mask = torch.zeros(B, T_max)
+                for b, ep in enumerate(batch):
+                    T = ep["T"]
+                    obs_batch[b, :T] = torch.from_numpy(ep["obs"])
+                    action_batch[b, :T] = torch.from_numpy(ep["action"])
+                    mask[b, :T] = ep["weight"]
+
+                loss = self._compute_loss(obs_batch, action_batch, mask)
+                total_loss += float(loss.item())
+                n_batches += 1
+
+        return total_loss / max(1, n_batches)
 
     def save_checkpoint(self, path: str) -> None:
         import os

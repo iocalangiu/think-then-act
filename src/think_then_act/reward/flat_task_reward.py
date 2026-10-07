@@ -52,6 +52,28 @@ project's standing genuine-grasp success bonus:
   displacement DOES materialize, just via an illegitimate contact) so it
   needs its own term, not a side effect of the other.
 
+Update 2026-10-02, success_bonus/stillness redesign: the first version of
+this reward paid success_bonus EVERY step once carrying held, regardless
+of further motion — confirmed via a direct PPO-vs-BC trace comparison
+(same eval seed, both genuine successes) that this gave literally zero
+incentive to ever stop: after the real grasp completed, the policy kept
+commanding dz~=-0.85 to -0.92 for the rest of the episode while grip_z
+sat flatlined, totally unaffected by PPO training. Quantified why:
+discrepancy_weight=2.0 times a typical ~0.03-0.04m discrepancy is only
+~0.06-0.08 per step, dwarfed 60-80x by the unconditional +5 success_bonus
+— the penalty was pointed at the right thing but numerically irrelevant
+against a reward that pays out the same whether the policy holds still
+or thrashes. Fix: success_bonus now pays ONLY once the block is actually
+AT the target (d_block_target <= move_to_target_threshold, the same
+distance the env's own is_success uses) AND is reduced by a stillness
+penalty on the gripper's own translation action — same per-step
+dollar-for-motion idea subgoal_reward.py's close_gripper_stillness_weight
+already uses during grasping, just applied to the "already succeeded,
+now hold" phase instead. During transport (carrying but not yet at
+target) there is deliberately NO bonus and NO stillness requirement —
+real translation is exactly what should be happening there; only sitting
+at the target rewards (and requires) going still.
+
 Both weights start at a reasoned-but-unvalidated default, same as every
 other reward term's history in this project (see subgoal_reward.py's own
 extensive per-weight calibration comments) — check actual training
@@ -79,7 +101,17 @@ class FlatTaskWeights:
                                        # subgoal_reward.py), which penalizes a conceptually similar
                                        # "ended up far from the block" quantity on a comparable (metres)
                                        # scale, not independently tuned yet.
-    success_bonus: float = 5.0        # one-time-per-step bonus while genuine success holds
+    success_bonus: float = 5.0        # paid only while AT the target (carrying AND d_block_target <=
+                                       # move_to_target_threshold) — NOT merely while carrying, see module
+                                       # docstring's 2026-10-02 update for why the original every-step
+                                       # version gave zero incentive to ever stop moving.
+    stillness_weight: float = 3.0     # penalty on ||action[:3]|| while AT the target, same role as
+                                       # subgoal_reward.py's close_gripper_stillness_weight — calibrated
+                                       # so a near-max-magnitude action (||.||~=1.73, tanh-bounded) costs
+                                       # close to success_bonus itself (3.0*1.73~=5.2), i.e. holding still
+                                       # is clearly preferable to continuing to move once already there.
+    move_to_target_threshold: float = 0.05   # metres, block-target distance — same value the native env's
+                                       # own is_success and subgoal_reward.py's reward_move_to_target use.
     lift_threshold: float = 0.02      # metres above resting height counted as "lifted" — same
                                        # value used everywhere else in this project
     pos_scale: float = 0.05           # metres per action unit — this project's own known per-step
@@ -142,6 +174,7 @@ def compute_flat_task_reward(
     # eval code, rather than switching back to "approach" the instant
     # contact force reads zero for one step.
     carrying = ever_genuinely_grasped or genuinely_grasped_now
+    at_target = carrying and d_block_target <= weights.move_to_target_threshold
     reward = (-weights.carry_weight * d_block_target if carrying
               else -weights.approach_weight * d_grip_block)
 
@@ -150,13 +183,22 @@ def compute_flat_task_reward(
     discrepancy = float(np.linalg.norm(intended_delta - realized_delta))
     reward -= weights.discrepancy_weight * discrepancy
 
-    if carrying:
-        reward += weights.success_bonus
+    # success_bonus now pays ONLY at the target, reduced by a stillness
+    # penalty on the gripper's own translation action — see module
+    # docstring's 2026-10-02 update for why the original every-step-while-
+    # carrying version gave zero incentive to ever stop moving. During
+    # transport (carrying but not yet at_target) neither term applies:
+    # real motion is exactly what should be happening there.
+    translation_norm = 0.0
+    if at_target:
+        translation_norm = float(np.linalg.norm(action[:3]))
+        reward += weights.success_bonus - weights.stillness_weight * translation_norm
 
     return reward, {
         "d_grip_block": round(d_grip_block, 5), "d_block_target": round(d_block_target, 5),
         "genuine_grasp_now": genuinely_grasped_now, "discrepancy": round(discrepancy, 5),
         "height_above_resting": round(height_above_resting, 5), "carrying": carrying,
+        "at_target": at_target, "translation_norm": round(translation_norm, 5),
     }
 
 

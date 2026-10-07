@@ -1,35 +1,48 @@
 """
-train_multicube_stack_ppo.py
+train_multicube_stack_ppo_selfimitation.py
 
-PPO on training/multicube_stack_env.py's MultiCubeStackEnv -- the
-reward-driven alternative to the demo-collection+BC-fine-tune approach
-tried first for "release the cube and continue to the next one" (that
-approach broke the base single-cube skill without teaching the target
-behavior, see memory: flat_policy_ppo_generalization). The environment
-itself switches the active goal to the next cube the instant the current
-one is genuinely placed -- not a scripted transition -- so the policy has
-to discover release-and-continue through ordinary PPO exploration against
-the reward, the same mechanism that already fixed drag/idle-churn on the
-single-cube task without anyone hand-authoring those fixes.
+PPO on MultiCubeStackEnv, warm-started from the BEST available checkpoint
+(bc_multicube_finetune_v1.pt, 46.7% fully-autonomous 2-cube success — see
+memory: flat_policy_ppo_generalization) instead of the raw single-cube PPO
+checkpoint the earlier, abandoned PPO-for-2-cubes attempt used. That
+earlier attempt showed a real, sustained collapse even at lr=1e-4 — the
+user's hypothesis for a retry: a much stronger starting point should be
+far more stable, AND augment PPO with an experience-replay / self-
+imitation auxiliary update (FlatTaskPPOTrainer.bc_replay_step, added
+alongside this script) that directly re-emphasizes genuine successes via
+a supervised regression step, independent of the PPO batch's own GAE
+math. Motivation: this task's success rate is nowhere near 100% (19-47%
+range across every checkpoint tried so far), so a sparse-success on-
+policy batch's few successes can get outweighed by its many failures in
+the clipped-surrogate gradient even when the successes themselves are
+exactly the behavior worth reinforcing.
 
-Warm-starts from the pose-randomized single-cube PPO checkpoint (already
-knows grasp/carry/place) rather than training from scratch -- same
-warm-start-from-BC recipe as train_flat_task_ppo.py (critic-only warmup +
-low initial log_std), since a from-scratch actor on a sparse multi-cube
-task would have to rediscover the base skill AND the transition behavior
-simultaneously, a much harder exploration problem.
+Replay buffer: seeded from the existing combined 2-cube demo pool
+(demonstrations/stack2_demos_combined_v2.pkl, 600 genuine demos — already
+on disk, no need to wait for PPO's own successes to populate it from
+scratch), then grown every iteration with whatever genuine on-policy
+successes this run's own rollouts produce (info["done"], the same
+stack-integrity-checked flag collect_rollouts already reports as
+"genuine_success" per rollout — see rollout_workers._run_episode_flat).
+Capped at replay_buffer_max via FIFO eviction of the OLDEST entries (seed
+demos included) — intentional: as training progresses, the buffer should
+increasingly reflect the CURRENT policy's own successful behavior
+distribution, not stay anchored to the original scripted-assisted demos.
 
-Cube count/identity/order are randomized every episode (see
-MultiCubeStackEnv.reset()) so the policy can't shortcut via step-counting
--- see that class's own docstring and the project history around
-2026-10-03 for why this is "trained generalization," not literal
-in-context learning (this GRU has no mechanism for the latter).
+Fallback not automated here, left as a manual next step if this still
+doesn't improve: scripts/collect_stack2_genuine_demos_finetune.py can be
+rerun against whatever the current best checkpoint is (bootstrapping a
+fresh, larger genuine-demo batch), merged into a new combined pool, and
+passed as --replay-seed-demos-path on a continued run — same resume-safe/
+incremental-save discipline as that script already has. Deliberately NOT
+wired to auto-trigger mid-training: that would mean spawning a second
+Modal function from inside this one, a much larger change to review than
+starting with a clean, cheap first attempt.
 
 Run with:
-    modal run --detach scripts/train_multicube_stack_ppo.py \\
-        --warm-start-ckpt checkpoints/flat_task_ppo_poserand_v2_cont_best.pt
-    modal run --detach scripts/train_multicube_stack_ppo.py --n-workers 1 --n-iterations 3 --n-rollouts 8
-                                                              # quick sanity check, no process pool
+    modal run --detach scripts/train_multicube_stack_ppo_selfimitation.py
+    modal run --detach scripts/train_multicube_stack_ppo_selfimitation.py \\
+        --n-workers 1 --n-iterations 3 --n-rollouts 8   # quick sanity check, no process pool
 """
 
 import modal
@@ -37,7 +50,7 @@ from think_then_act.modal_app import app, rl_image, model_volume, MODEL_CACHE_DI
 
 
 @app.function(image=rl_image, gpu=None, cpu=8.0, volumes={MODEL_CACHE_DIR: model_volume}, timeout=3600 * 6)
-def train_multicube_stack_ppo(
+def train_multicube_stack_ppo_selfimitation(
     n_iterations: int = 300,
     max_episode_steps: int = 320,
     eval_episodes: int = 30,
@@ -49,13 +62,14 @@ def train_multicube_stack_ppo(
     episodes_per_minibatch: int = 16,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
-    lr: float = 3e-4,
+    lr: float = 1e-4,
+    bc_replay_lr: float = 1e-4,
     entropy_coef: float = 0.01,
     clip_eps: float = 0.2,
     n_epochs: int = 4,
     early_stop_patience: int = 3,
     early_stop_threshold: float = 0.6,
-    warm_start_ckpt: str = "checkpoints/flat_task_ppo_poserand_v2_cont_best.pt",
+    warm_start_ckpt: str = "checkpoints/bc_multicube_finetune_v1.pt",
     warm_start_log_std_init: float = -2.0,
     critic_warmup_iters: int = 5,
     discrepancy_weight: float = 2.0,
@@ -65,14 +79,17 @@ def train_multicube_stack_ppo(
     precision_weight: float = 10.0,
     disturbance_weight: float = 15.0,
     randomize_pose_prob: float = 1.0,
-    pose_exclude_band: float = 0.35,
-    pose_max_frac: float = 0.85,
-    min_cubes: int = 1,
-    max_cubes: int = 3,
-    ckpt_name: str = "multicube_stack_ppo",
+    pose_scheme: str = "gripper_3d",
+    min_cubes: int = 2,
+    max_cubes: int = 2,
+    replay_seed_demos_path: str = "demonstrations/stack2_demos_combined_v2.pkl",
+    replay_buffer_max: int = 2000,
+    replay_batch_episodes: int = 64,
+    ckpt_name: str = "multicube_stack_ppo_selfimitation_v1",
 ) -> dict:
     import os
     import math
+    import pickle
     import numpy as np
     import torch
 
@@ -86,10 +103,20 @@ def train_multicube_stack_ppo(
     from think_then_act.training.multicube_stack_env import MultiCubeStackEnv
 
     print("\n" + "=" * 60)
-    print("  MULTI-CUBE STACK PPO (reward-driven, warm-started from single-cube PPO)")
+    print("  MULTI-CUBE STACK PPO + SELF-IMITATION REPLAY")
+    print("  (warm-started from the fine-tuned BC checkpoint, not raw single-cube PPO)")
     print("=" * 60)
 
     torch.manual_seed(seed)
+    rng_buf = np.random.default_rng(seed)
+
+    replay_buffer = []
+    if replay_seed_demos_path:
+        with open(os.path.join(MODEL_CACHE_DIR, replay_seed_demos_path), "rb") as f:
+            seed_data = pickle.load(f)
+        for d in seed_data["demonstrations"]:
+            replay_buffer.append({"obs": d["obs"], "teacher_action": d["teacher_action"]})
+        print(f"  [replay] seeded buffer with {len(replay_buffer)} demos from {replay_seed_demos_path}")
 
     weights_kwargs = dict(discrepancy_weight=discrepancy_weight, drag_weight=drag_weight,
                            success_bonus=success_bonus, stillness_weight=stillness_weight)
@@ -98,9 +125,10 @@ def train_multicube_stack_ppo(
         n_workers=n_workers, rnn_hidden_size=rnn_hidden_size, episodes_per_minibatch=episodes_per_minibatch,
         gamma=gamma, gae_lambda=gae_lambda, lr=lr, entropy_coef=entropy_coef, clip_eps=clip_eps,
         n_epochs=n_epochs, weights_kwargs=weights_kwargs,
-        randomize_pose_prob=randomize_pose_prob, pose_exclude_band=pose_exclude_band, pose_max_frac=pose_max_frac,
+        randomize_pose_prob=randomize_pose_prob, pose_scheme=pose_scheme,
         env_variant="multicube", min_cubes=min_cubes, max_cubes=max_cubes,
         precision_weight=precision_weight, disturbance_weight=disturbance_weight,
+        bc_replay_lr=bc_replay_lr,
     )
     trainer = FlatTaskPPOTrainer(config)
 
@@ -116,7 +144,7 @@ def train_multicube_stack_ppo(
 
     env_kwargs = config.env_kwargs()
     print(f"  min_cubes={min_cubes}  max_cubes={max_cubes}  randomize_pose_prob={randomize_pose_prob}  "
-          f"precision_weight={precision_weight}  disturbance_weight={disturbance_weight}")
+          f"pose_scheme={pose_scheme}")
 
     if warm_start_ckpt and critic_warmup_iters > 0:
         print(f"  [warm-start] running {critic_warmup_iters} critic-only warmup iteration(s)...")
@@ -131,21 +159,10 @@ def train_multicube_stack_ppo(
             print(f"    critic warmup {wi+1}/{critic_warmup_iters}: value_loss={warmup_metrics['value_loss']:.4f}")
 
     def run_eval(actor=None, n_eval_episodes: int = eval_episodes) -> dict:
-        """
-        Fixed held-out seeds (300_000+ep, a range distinct from every
-        other eval convention in this project) against MultiCubeStackEnv
-        directly. Reports BOTH the strict full-stack completion_rate
-        (every active cube in the episode genuinely placed) and a
-        graduated cube_placement_rate (total cubes placed / total cubes
-        across all episodes) -- the strict metric will likely be noisy
-        and near-zero early in training given episodes can have up to
-        max_cubes cubes each needing a genuine success in sequence; the
-        graduated one is the more informative early-progress signal.
-        """
         actor = actor if actor is not None else trainer.actor
         eval_env = MultiCubeStackEnv(
             min_cubes=min_cubes, max_cubes=max_cubes, max_episode_steps=max_episode_steps,
-            randomize_pose_prob=1.0, pose_exclude_band=pose_exclude_band, pose_max_frac=pose_max_frac,
+            randomize_pose_prob=1.0, pose_scheme=pose_scheme,
             precision_weight=precision_weight, disturbance_weight=disturbance_weight,
         )
         n_full_stack = 0
@@ -172,6 +189,30 @@ def train_multicube_stack_ppo(
             "cube_placement_rate": total_placed / total_cubes if total_cubes else 0.0,
         }
 
+    def harvest_genuine_rollouts(rollouts: list) -> int:
+        """Append this iteration's own genuine on-policy successes to the
+        replay buffer (bounded-action target = tanh(raw_sample), the same
+        convention bc_replay_step's loss uses), then FIFO-evict down to
+        replay_buffer_max. Returns how many were added."""
+        n_added = 0
+        for r in rollouts:
+            if not r.get("genuine_success"):
+                continue
+            obs = np.stack([s["obs"] for s in r["steps"]]).astype(np.float32)
+            action = np.tanh(np.stack([s["raw_sample"] for s in r["steps"]])).astype(np.float32)
+            replay_buffer.append({"obs": obs, "teacher_action": action})
+            n_added += 1
+        if len(replay_buffer) > replay_buffer_max:
+            del replay_buffer[: len(replay_buffer) - replay_buffer_max]
+        return n_added
+
+    def sample_replay_batch() -> list:
+        if not replay_buffer:
+            return []
+        n = min(replay_batch_episodes, len(replay_buffer))
+        idx = rng_buf.choice(len(replay_buffer), size=n, replace=False)
+        return [replay_buffer[i] for i in idx]
+
     ckpt_dir = os.path.join(MODEL_CACHE_DIR, "checkpoints")
     best_ckpt_path = os.path.join(ckpt_dir, f"{ckpt_name}_best.pt")
     initial_eval = run_eval()
@@ -197,32 +238,24 @@ def train_multicube_stack_ppo(
     stopped_early_at = None
     try:
         for i in range(n_iterations):
-            metrics = trainer.train_iteration(env_kwargs, i)
+            seeds = list(range(config.n_rollouts * i, config.n_rollouts * (i + 1)))
+            rollouts = trainer.collect_rollouts(env_kwargs, seeds)
+            ppo_metrics = trainer.ppo_step(rollouts)
+
+            n_harvested = harvest_genuine_rollouts(rollouts)
+            replay_batch = sample_replay_batch()
+            replay_metrics = trainer.bc_replay_step(replay_batch)
+
+            metrics = dict(ppo_metrics)
+            metrics["iteration"] = i + 1
+            metrics["n_harvested_this_iter"] = n_harvested
+            metrics["replay_buffer_size"] = len(replay_buffer)
+            metrics["bc_replay_loss"] = replay_metrics["bc_replay_loss"]
             history.append(metrics)
 
-            # Cheap (no eval) checkpoint EVERY iteration, decoupled from the
-            # costly eval+named-checkpoint cadence below -- running on
-            # preemptible Modal compute by deliberate choice (cheaper, but
-            # can be reclaimed at any point with no warning -- confirmed via
-            # modal.App.function's own nonpreemptible=False default, see
-            # memory: flat_policy_ppo_generalization's recurring-
-            # cancellation section), so minimizing how much training this
-            # loses per preemption matters more than it would on reserved
-            # compute. torch.save of this small GRU (hidden_dim=64) is fast;
-            # the volume commit is the real cost, worth paying every
-            # iteration specifically BECAUSE that's the only way a
-            # checkpoint survives the container actually being reclaimed.
             trainer.save_checkpoint(latest_ckpt_path)
             model_volume.commit()
 
-            # Written to the volume every iteration -- NOT just printed to
-            # stdout -- after two separate occasions this session where the
-            # background-task log capture silently lost most of a run's
-            # printed progress (only the tail/traceback survived), leaving
-            # no way to reconstruct the loss/eval curve after the fact. A
-            # JSON file on the volume survives exactly the same failure
-            # modes the checkpoints already do (preemption, connection
-            # loss) since it's committed on the same cadence.
             history_path = os.path.join(ckpt_dir, f"{ckpt_name}_history.json")
             with open(history_path, "w") as f:
                 import json
@@ -230,12 +263,13 @@ def train_multicube_stack_ppo(
                            "lr": lr, "ckpt_name": ckpt_name}, f, default=float)
 
             if (i + 1) % 5 == 0:
+                bc_loss_str = f"{metrics['bc_replay_loss']:.4f}" if metrics["bc_replay_loss"] is not None else "n/a"
                 print(f"  iter {i+1}/{n_iterations}  policy_loss={metrics['policy_loss']:.4f}  "
                       f"value_loss={metrics['value_loss']:.4f}  mean_reward={metrics['mean_reward']:.4f}  "
                       f"entropy={metrics['mean_entropy']:.4f}  approx_kl={metrics['approx_kl']:.4f}  "
-                      f"clip_frac={metrics['clip_fraction']:.3f}  "
                       f"train_genuine_rate={metrics['genuine_success_rate']:.2f}  "
-                      f"collect_s={metrics['collect_s']:.2f}  update_s={metrics['update_s']:.2f}")
+                      f"bc_replay_loss={bc_loss_str}  replay_buf={metrics['replay_buffer_size']}  "
+                      f"harvested={metrics['n_harvested_this_iter']}")
 
             if (i + 1) % checkpoint_every == 0:
                 ckpt = os.path.join(ckpt_dir, f"{ckpt_name}_iter{i+1}.pt")
@@ -287,6 +321,7 @@ def train_multicube_stack_ppo(
             "cube_placement_rate": round(final_eval["cube_placement_rate"], 4),
             "best_completion_rate": round(best_completion_rate, 4),
             "eval_history": eval_history, "stopped_early_at": stopped_early_at,
+            "final_replay_buffer_size": len(replay_buffer),
         }
     finally:
         trainer.close_pool()
@@ -301,43 +336,28 @@ def main(
     seed: int = 0,
     n_rollouts: int = 64,
     n_workers: int = 8,
-    rnn_hidden_size: int = 64,
-    episodes_per_minibatch: int = 16,
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    lr: float = 3e-4,
-    entropy_coef: float = 0.01,
-    clip_eps: float = 0.2,
-    n_epochs: int = 4,
+    lr: float = 1e-4,
+    bc_replay_lr: float = 1e-4,
+    critic_warmup_iters: int = 5,
+    warm_start_log_std_init: float = -2.0,
     early_stop_patience: int = 3,
     early_stop_threshold: float = 0.6,
-    warm_start_ckpt: str = "checkpoints/flat_task_ppo_poserand_v2_cont_best.pt",
-    warm_start_log_std_init: float = -2.0,
-    critic_warmup_iters: int = 5,
-    discrepancy_weight: float = 2.0,
-    drag_weight: float = 20.0,
-    success_bonus: float = 5.0,
-    stillness_weight: float = 3.0,
-    precision_weight: float = 10.0,
-    disturbance_weight: float = 15.0,
-    randomize_pose_prob: float = 1.0,
-    pose_exclude_band: float = 0.35,
-    pose_max_frac: float = 0.85,
-    min_cubes: int = 1,
-    max_cubes: int = 3,
-    ckpt_name: str = "multicube_stack_ppo",
+    warm_start_ckpt: str = "checkpoints/bc_multicube_finetune_v1.pt",
+    min_cubes: int = 2,
+    max_cubes: int = 2,
+    replay_seed_demos_path: str = "demonstrations/stack2_demos_combined_v2.pkl",
+    replay_buffer_max: int = 2000,
+    replay_batch_episodes: int = 64,
+    ckpt_name: str = "multicube_stack_ppo_selfimitation_v1",
 ):
-    result = train_multicube_stack_ppo.remote(
+    result = train_multicube_stack_ppo_selfimitation.remote(
         n_iterations=n_iterations, max_episode_steps=max_episode_steps, eval_episodes=eval_episodes,
         checkpoint_every=checkpoint_every, seed=seed, n_rollouts=n_rollouts, n_workers=n_workers,
-        rnn_hidden_size=rnn_hidden_size, episodes_per_minibatch=episodes_per_minibatch, gamma=gamma,
-        gae_lambda=gae_lambda, lr=lr, entropy_coef=entropy_coef, clip_eps=clip_eps, n_epochs=n_epochs,
-        early_stop_patience=early_stop_patience, early_stop_threshold=early_stop_threshold,
-        warm_start_ckpt=warm_start_ckpt, warm_start_log_std_init=warm_start_log_std_init,
-        critic_warmup_iters=critic_warmup_iters, discrepancy_weight=discrepancy_weight,
-        drag_weight=drag_weight, success_bonus=success_bonus, stillness_weight=stillness_weight,
-        precision_weight=precision_weight, disturbance_weight=disturbance_weight,
-        randomize_pose_prob=randomize_pose_prob, pose_exclude_band=pose_exclude_band, pose_max_frac=pose_max_frac,
-        min_cubes=min_cubes, max_cubes=max_cubes, ckpt_name=ckpt_name,
+        lr=lr, bc_replay_lr=bc_replay_lr, critic_warmup_iters=critic_warmup_iters,
+        warm_start_log_std_init=warm_start_log_std_init, early_stop_patience=early_stop_patience,
+        early_stop_threshold=early_stop_threshold, warm_start_ckpt=warm_start_ckpt,
+        min_cubes=min_cubes, max_cubes=max_cubes, replay_seed_demos_path=replay_seed_demos_path,
+        replay_buffer_max=replay_buffer_max, replay_batch_episodes=replay_batch_episodes,
+        ckpt_name=ckpt_name,
     )
     print("\n", result)

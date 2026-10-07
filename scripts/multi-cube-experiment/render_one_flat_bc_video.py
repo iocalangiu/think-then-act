@@ -8,8 +8,8 @@ and saves it via env.setup.save_video (now with -movflags +faststart,
 base64 data URI).
 
 Run with:
-    modal run scripts/render_one_flat_bc_video.py
-    modal run scripts/render_one_flat_bc_video.py --seed 8   # a known-slide seed
+    modal run scripts/multi-cube-experiment/render_one_flat_bc_video.py
+    modal run scripts/multi-cube-experiment/render_one_flat_bc_video.py --seed 8   # a known-slide seed
 """
 
 import modal

@@ -11,8 +11,8 @@ with that hypothesis) or genuinely reaches the extremes but something else
 goes wrong (inconsistent with it).
 
 Run with:
-    modal run scripts/render_mdn_rollout_video.py --seed 0
-    modal run scripts/render_mdn_rollout_video.py --seed 5 --decode-mode weighted_mean
+    modal run scripts/multi-cube-experiment/render_mdn_rollout_video.py --seed 0
+    modal run scripts/multi-cube-experiment/render_mdn_rollout_video.py --seed 5 --decode-mode weighted_mean
 """
 
 import modal

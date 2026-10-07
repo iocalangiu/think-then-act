@@ -393,3 +393,132 @@ class CVAEPolicy(nn.Module):
         finally:
             if was_training:
                 self.train()
+
+
+# ---------------------------------------------------------------------------
+# Diffusion (DDPM-style) action head
+# ---------------------------------------------------------------------------
+
+DIFFUSION_T = 20
+
+
+class DiffusionPolicy(nn.Module):
+    """
+    Lightweight DDPM-style diffusion action head, same GRU trunk as every
+    other class in this file. Models the action via T=20 steps of learned
+    denoising conditioned on the GRU context, instead of a single forward-
+    pass regression (mse) or an explicit parametric distribution (mdn/cvae)
+    -- the literature's standard tool for genuinely multi-modal action
+    distributions, directly relevant given this project's own MDN
+    investigation (see memory: flat_policy_bc_scaling) where hedging under
+    a likelihood-based loss, not architecture per se, was the leading
+    suspect for that head's weaker performance.
+
+    T=20 and a small per-step MLP keep this "lightweight" per this
+    project's own standard -- action_dim=4 is tiny, so even T=20
+    sequential denoising steps at act()-time is cheap (20 small MLP
+    forward passes per env step, negligible next to one MuJoCo physics
+    step).
+    """
+
+    def __init__(self, obs_dim: int, action_dim: int = ACTION_DIM, hidden_dim: int = 64,
+                 rnn_hidden_size: int = 64, diffusion_steps: int = DIFFUSION_T, time_embed_dim: int = 16):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.rnn_hidden_size = rnn_hidden_size
+        self.T = diffusion_steps
+
+        self.input_norm = nn.LayerNorm(obs_dim)
+        self.pre_gru = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.Tanh())
+        self.gru = nn.GRU(hidden_dim, rnn_hidden_size, batch_first=True)
+
+        self.time_embed = nn.Embedding(self.T, time_embed_dim)
+        self.eps_net = nn.Sequential(
+            nn.Linear(rnn_hidden_size + action_dim + time_embed_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+        # beta_max=0.02 is the standard DDPM value for T~1000 steps -- at
+        # this project's deliberately small T=20, that schedule barely
+        # corrupts the signal even at the FINAL training step
+        # (alphas_cumprod[-1]~=0.82, ~90% signal remaining), while act()'s
+        # reverse process always STARTS from true Gaussian noise (0%
+        # signal). That mismatch was confirmed directly (2026-10-05): a
+        # trained checkpoint's decoded actions clustered near small
+        # constant values regardless of context, while teacher actions are
+        # almost always near +-1 (saturated) -- the classic signature of a
+        # reverse process operating far outside what it was ever exposed
+        # to in training. beta_max=0.5 drives alphas_cumprod[-1] to ~0.002
+        # (99.8% corrupted), properly matching real inference conditions.
+        betas = torch.linspace(1e-4, 0.5, self.T)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+
+    def _gru_forward(self, obs: torch.Tensor, hidden_state=None) -> tuple:
+        return _run_recurrent_trunk(self.input_norm, self.pre_gru, self.gru, obs, hidden_state, self.rnn_hidden_size)
+
+    def diffusion_loss(self, obs: torch.Tensor, action: torch.Tensor, hidden_state=None) -> tuple:
+        """
+        obs: (B, T, obs_dim), action: (B, T, action_dim) -- TRAINING-time
+        use, same shape convention as elbo_loss/nll_loss elsewhere in this
+        file. Samples an INDEPENDENT random diffusion timestep per (batch,
+        episode-step) element -- standard DDPM practice, not per-sequence
+        -- and returns the per-step (B, T) noise-prediction MSE.
+        """
+        gru_out, next_hidden, _ = self._gru_forward(obs, hidden_state)   # (B, Tep, H)
+        B, Tep, _ = action.shape
+        t_idx = torch.randint(0, self.T, (B, Tep), device=action.device)
+        sqrt_ac = self.alphas_cumprod[t_idx].sqrt().unsqueeze(-1)
+        sqrt_1m_ac = (1.0 - self.alphas_cumprod[t_idx]).sqrt().unsqueeze(-1)
+        eps = torch.randn_like(action)
+        x_t = sqrt_ac * action + sqrt_1m_ac * eps
+
+        t_emb = self.time_embed(t_idx)
+        eps_in = torch.cat([gru_out, x_t, t_emb], dim=-1)
+        eps_hat = self.eps_net(eps_in)
+        per_step = ((eps_hat - eps) ** 2).sum(dim=-1)
+        return per_step, next_hidden
+
+    def act(self, obs: np.ndarray, hidden_state=None, deterministic: bool = False) -> tuple:
+        """
+        Full T-step ancestral denoising from x_T (zeros if deterministic,
+        else Gaussian noise) down to x_0, conditioned on this step's GRU
+        context. deterministic=True also skips the per-step noise
+        injection in the reverse process (equivalent to DDIM with eta=0) --
+        same input always produces the same output, matching every other
+        policy class's deterministic act() convention in this project.
+        Final tanh is a numerical safety clamp only (training never
+        applies one -- the loss is on predicted NOISE, not the action
+        value directly), covering the rare case T=20 steps of
+        approximation drift a hair outside [-1, 1].
+        """
+        was_training = _act_eval_guard(self)
+        self.eval()
+        try:
+            with torch.no_grad():
+                obs_t = torch.from_numpy(np.asarray(obs, dtype=np.float32)).unsqueeze(0)
+                gru_out, next_hidden, _ = self._gru_forward(obs_t, hidden_state)   # (1, 1, H)
+                context = gru_out.squeeze(1)   # (1, H)
+                x = torch.zeros(1, self.action_dim) if deterministic else torch.randn(1, self.action_dim)
+                for t in reversed(range(self.T)):
+                    t_idx = torch.full((1,), t, dtype=torch.long)
+                    t_emb = self.time_embed(t_idx)
+                    eps_hat = self.eps_net(torch.cat([context, x, t_emb], dim=-1))
+                    alpha_t = self.alphas[t]
+                    alpha_bar_t = self.alphas_cumprod[t]
+                    beta_t = self.betas[t]
+                    mean = (1.0 / alpha_t.sqrt()) * (x - (beta_t / (1.0 - alpha_bar_t).sqrt()) * eps_hat)
+                    if t > 0 and not deterministic:
+                        x = mean + beta_t.sqrt() * torch.randn_like(x)
+                    else:
+                        x = mean
+                action = torch.tanh(x)
+            return action.squeeze(0).numpy(), next_hidden
+        finally:
+            if was_training:
+                self.train()

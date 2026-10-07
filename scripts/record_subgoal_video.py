@@ -21,6 +21,17 @@ to sample instead.
 
 No GPU needed — same as train_low_level.py.
 
+Every frame is two views side by side, 960x480 total: the env's own default
+camera (left) and a synthetic straight-down MjvCamera centered on the table
+(right, not one of the model's own named cameras — none of
+head_camera_rgb/gripper_camera_rgb/external_camera_0/lidar is top-down,
+confirmed by enumerating them directly). Added because the default angled
+view badly foreshortens lateral (xy) distances — e.g. a 21cm gripper-block
+gap that LOOKED close in the single-camera video, confirmed by the actual
+logged block_pos/grip_pos numbers to be nowhere near align_xy's 0.02m
+success threshold. The top-down view makes xy separation direct to judge by
+eye instead of trusting perspective.
+
 Run with:
     modal run scripts/record_subgoal_video.py --subgoal align_xy
     modal run scripts/record_subgoal_video.py --subgoal align_xy --ckpt-iter 50
@@ -32,6 +43,11 @@ Run with:
                                                               # latest/final one — matters
                                                               # because training can regress
                                                               # after peaking (seen with GRPO)
+    modal run scripts/record_subgoal_video.py --subgoal align_xy --algo ppo --use-best --seed 7 --width 0.01
+                                                              # pin block size (same mechanism
+                                                              # as record_full_rollout.py) —
+                                                              # width 0.01 alone keeps length/
+                                                              # height at the base env's 0.05m
 
 Outputs (on the volume, under /model-cache/subgoal_videos/):
     {subgoal}_before.mp4   — random-init policy
@@ -73,10 +89,19 @@ def record_subgoal_video(
                             # trained low-level checkpoint be A/B'd with vs. without
                             # perception noise in its observation, on the same seed,
                             # rather than needing to move the checkpoint file to test this.
+    size: float = 0.0,     # 0.0 = no pin, use the base env's fixed 5cm cube (unchanged
+                            # default behavior) — same pinning mechanism as
+                            # record_full_rollout.py's --size/--width/--length/--height.
+                            # >0: pin ALL axes to this value (a uniform cube) unless
+                            # width/length/height overrides one.
+    width: float = 0.0,    # 0.0 = use `size` for this axis
+    length: float = 0.0,   # 0.0 = use `size` for this axis
+    height: float = 0.0,   # 0.0 = use `size` for this axis
 ) -> dict:
     import os, re, json
     import numpy as np
     import torch
+    import mujoco
 
     os.environ["MUJOCO_GL"]         = "osmesa"
     os.environ["PYOPENGL_PLATFORM"] = "osmesa"
@@ -84,6 +109,7 @@ def record_subgoal_video(
     import gymnasium as gym
     import gymnasium_robotics  # noqa: F401
 
+    from think_then_act.env.block_randomization import get_block_dims
     from think_then_act.env.setup import setup_env, save_video
     from think_then_act.env.wrapper import ObservationHarness
     from think_then_act.perception.block_pose_predictor import BlockPosePredictor
@@ -92,7 +118,7 @@ def record_subgoal_video(
     from think_then_act.reward.subgoal_reward import SUBGOAL_LABELS
     from think_then_act.training.checkpoints import resolve_subgoal_checkpoint
     from think_then_act.training.subgoal_env import SubgoalConditionedEnv
-    from think_then_act.training.subgoal_features import SUBGOAL_OBS_DIM
+    from think_then_act.training.subgoal_features import obs_dim_for_subgoal
 
     if subgoal not in SUBGOAL_LABELS:
         raise ValueError(f"Unknown subgoal {subgoal!r}; must be one of {SUBGOAL_LABELS}")
@@ -162,7 +188,7 @@ def record_subgoal_video(
     align_xy_policy = None
     align_xy_ckpt = os.path.join(ckpt_dir, "low_level_align_xy_ppo_best.pt")
     if subgoal == "descend" and os.path.exists(align_xy_ckpt):
-        align_xy_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+        align_xy_policy = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal("align_xy"))
         align_xy_ckpt_data = torch.load(align_xy_ckpt, map_location="cpu")
         align_xy_policy.load_state_dict(
             align_xy_ckpt_data["actor"] if isinstance(align_xy_ckpt_data, dict) and "actor" in align_xy_ckpt_data
@@ -170,6 +196,71 @@ def record_subgoal_video(
         )
         align_xy_policy.eval()
         print(f"  align_xy policy   <- {align_xy_ckpt}  (descend's episode setup)")
+
+    # Same degenerate (x, x) range mechanism as record_full_rollout.py — an
+    # all-zero default leaves randomize_block_size False (the original fixed
+    # 5cm cube), byte-identical to before this param existed.
+    width_val  = width  or size
+    length_val = length or size
+    height_val = height or size
+    pin_size = bool(width_val or length_val or height_val)
+    randomize_kwargs = {}
+    if pin_size:
+        randomize_kwargs = dict(
+            randomize_block_size=True,
+            width_range=(width_val, width_val) if width_val else None,
+            length_range=(length_val, length_val) if length_val else None,
+            height_range=(height_val, height_val) if height_val else None,
+        )
+        print(f"  pinned block size -> width={width_val} length={length_val} height={height_val}")
+
+    # Second camera, side-by-side with the default view — straight down,
+    # centered on the table (env/setup.py's TABLE_TOP_Z=0.400, table center
+    # [1.30, 0.75] — same constants get_meaningful_table_collision_positions
+    # uses). distance=3.0 was picked empirically (1.0 was so close the
+    # gripper filled the frame and the block/table weren't visible at all;
+    # 3.0 keeps the whole table + arm reach in frame with margin).
+    #
+    # NOT one of the model's own named cameras (none of head_camera_rgb/
+    # gripper_camera_rgb/external_camera_0/lidar is top-down, confirmed by
+    # enumerating them directly), and deliberately NOT a second manually
+    # constructed mujoco.Renderer sharing this process's OSMesa context with
+    # gymnasium's own renderer — that was the first thing tried, and it
+    # corrupts gymnasium's OWN render() from the very next call onward
+    # (confirmed by extracting real frames from a saved video: frame 0 was
+    # correctly ordered, frame 2 onward had the two views SWAPPED; a second
+    # variant that recreated+closed a mujoco.Renderer every frame was worse
+    # — gymnasium's render() started returning None, i.e. black frames, the
+    # moment any second Renderer touched the shared context). Two competing
+    # `mujoco.Renderer`/MujocoRenderer instances in one process is not a
+    # supported pattern here, at least not under osmesa.
+    #
+    # Fix: a fully separate gym.make(...) env (its OWN isolated renderer,
+    # the way gymnasium expects one to be used) with `default_camera_config`
+    # set to the top-down pose at construction — confirmed this actually
+    # accepts azimuth/elevation/distance/lookat and renders correctly, no
+    # swap, no black frames. Its own physics are never stepped/simulated;
+    # each frame this env's qpos/qvel are copied directly from the PRIMARY
+    # env's mujoco data (same MJCF, same array layout) and mj_forward()
+    # recomputes derived quantities (body/site positions) before rendering
+    # — a passive mirror, not an independent simulation, so there's no
+    # determinism/RNG-drift risk from replaying actions in two places.
+    def make_topdown_env():
+        cam_cfg = {"distance": 3.0, "azimuth": 90.0, "elevation": -90.0,
+                   "lookat": np.array([1.30, 0.75, 0.40])}
+        topdown_env = gym.make("FetchPickAndPlace-v3", render_mode="rgb_array",
+                                default_camera_config=cam_cfg)
+        # MUST match the primary env's setup_env() call below — that shifts
+        # the robot base body_pos on the MODEL, not just per-step state.
+        # Without this, combined_frame()'s qpos/qvel copy from primary to
+        # mirror computes forward kinematics against a DIFFERENT base
+        # offset, so the rendered arm ends up mispositioned/rotated
+        # relative to the (unaffected) table/block/target in the top-down
+        # view — found 2026-09-01 via record_align_xy_multi_location_video.py's
+        # screenshot (table/block/target correct, only the robot was wrong).
+        setup_env(topdown_env)
+        topdown_env.reset()
+        return topdown_env
 
     def make_env():
         # +250, not *2: init_episode_before_subgoal's oracle pre-subgoal
@@ -184,14 +275,39 @@ def record_subgoal_video(
         wrapped = SubgoalConditionedEnv(
             base, subgoal=subgoal, collision_model=collision_model,
             pose_model=pose_model, align_xy_policy=align_xy_policy, max_episode_steps=max_steps,
+            **randomize_kwargs,
         )
         return base, wrapped
 
     def rollout(policy) -> tuple:
         base, env = make_env()
+        topdown_env = make_topdown_env()
+
+        def combined_frame() -> np.ndarray:
+            # Mirror, not simulate: copy the PRIMARY env's exact physics
+            # state across (both envs share the same MJCF -> same qpos/qvel
+            # layout) rather than replaying actions in topdown_env, so the
+            # two views are guaranteed pixel-exact-state-synced every frame
+            # regardless of any RNG call this env's own reset/step made.
+            primary = base.unwrapped
+            mirror = topdown_env.unwrapped
+            mirror.data.qpos[:] = primary.data.qpos[:]
+            mirror.data.qvel[:] = primary.data.qvel[:]
+            mujoco.mj_forward(mirror.model, mirror.data)
+            topdown_frame = topdown_env.render()
+            return np.concatenate([base.last_frame(), topdown_frame], axis=1)
+
         rng = np.random.default_rng(seed)
         obs, info = env.reset(rng=rng)
-        frames = [base.last_frame()]
+
+        # Read back what was ACTUALLY sampled this episode, not the raw CLI
+        # args — when only `width` is pinned, length/height fall back to
+        # block_randomization.py's own (randomized, not zero) default range,
+        # so trusting width_val/length_val/height_val directly for the
+        # output filename would mislabel it as l=0.0000/h=0.0000. Same fix
+        # record_full_rollout.py already applies for the same reason.
+        actual_dims = get_block_dims(base.unwrapped.model)
+        frames = [combined_frame()]
         total_reward = 0.0
         success = False
         # Per-step block/gripper trajectory — lets a caller pinpoint exactly
@@ -215,7 +331,7 @@ def record_subgoal_video(
             action = policy.act(obs, deterministic=not stochastic)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
-            frames.append(base.last_frame())
+            frames.append(combined_frame())
             trajectory.append({
                 "step": step, "action": np.asarray(action).tolist(),
                 "block_pos": info.get("block_pos"), "grip_pos": info.get("grip_pos"),
@@ -228,7 +344,8 @@ def record_subgoal_video(
                 break
 
         env.close()
-        return frames, total_reward, success, trajectory
+        topdown_env.close()
+        return frames, total_reward, success, trajectory, actual_dims
 
     out_dir = os.path.join(MODEL_CACHE_DIR, "subgoal_videos")
     os.makedirs(out_dir, exist_ok=True)
@@ -239,11 +356,20 @@ def record_subgoal_video(
     # ------------------------------------------------------------------
     print(f"\n[1/2] Recording BEFORE (random init)...")
     torch.manual_seed(seed)
-    before_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
-    frames, total_reward, success, before_trajectory = rollout(before_policy)
-    before_path = os.path.join(out_dir, f"{subgoal}{pose_tag}_before.mp4")
+    before_policy = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal(subgoal))
+    frames, total_reward, success, before_trajectory, actual_dims = rollout(before_policy)
+    # Same w{}_l{}_h{} naming as record_full_rollout.py/record_close_gripper_at_size.py
+    # so a pinned-size video from any of the three scripts is directly
+    # file-name-comparable. Built from the BEFORE rollout's actual sampled
+    # dims (same seed -> same draw for the AFTER rollout too, see rollout()'s
+    # own comment) — empty (unpinned) leaves filenames byte-identical to
+    # before this param existed.
+    size_tag = f"_w{actual_dims['width']:.4f}_l{actual_dims['length']:.4f}_h{actual_dims['height']:.4f}" if pin_size else ""
+    if pin_size:
+        print(f"  actual sampled block dims -> {actual_dims}")
+    before_path = os.path.join(out_dir, f"{subgoal}{pose_tag}{size_tag}_before.mp4")
     save_video(frames, before_path, fps=10)
-    before_traj_path = os.path.join(out_dir, f"{subgoal}{pose_tag}_before_trajectory.json")
+    before_traj_path = os.path.join(out_dir, f"{subgoal}{pose_tag}{size_tag}_before_trajectory.json")
     with open(before_traj_path, "w") as f:
         json.dump(before_trajectory, f, indent=2)
     model_volume.commit()   # commit immediately — if the "after" step below throws
@@ -266,14 +392,14 @@ def record_subgoal_video(
     # "after" — trained checkpoint
     # ------------------------------------------------------------------
     print(f"\n[2/2] Recording AFTER ({os.path.basename(after_ckpt)})...")
-    after_policy = SubgoalGaussianPolicy(obs_dim=SUBGOAL_OBS_DIM)
+    after_policy = SubgoalGaussianPolicy(obs_dim=obs_dim_for_subgoal(subgoal))
     ckpt = torch.load(after_ckpt, map_location="cpu")
     # PPO checkpoints (low_level_ppo.py's save_checkpoint) are
     # {"actor": ..., "critic": ...} — only the actor is needed for a
     # rollout. GRPO checkpoints are a flat state_dict, loaded as-is.
     after_policy.load_state_dict(ckpt["actor"] if isinstance(ckpt, dict) and "actor" in ckpt else ckpt)
     after_policy.eval()
-    frames, total_reward, success, trajectory = rollout(after_policy)
+    frames, total_reward, success, trajectory, _after_dims = rollout(after_policy)
     iter_match = re.search(r"_iter(\d+)\.pt$", after_ckpt)
     if iter_match:
         tag = iter_match.group(1)
@@ -281,7 +407,7 @@ def record_subgoal_video(
         tag = "best"
     else:
         tag = "final"
-    after_path = os.path.join(out_dir, f"{subgoal}{suffix}{pose_tag}_after_{tag}.mp4")
+    after_path = os.path.join(out_dir, f"{subgoal}{suffix}{pose_tag}{size_tag}_after_{tag}.mp4")
     save_video(frames, after_path, fps=10)
 
     # Per-step block/gripper trajectory for the trained rollout — pinpoints
@@ -290,7 +416,7 @@ def record_subgoal_video(
     # (wrist translating) or happens even while the action's translation
     # is ~0 (fingers-closing-on-off-center-block instead). Saved as JSON
     # next to the video; also printed so it's visible straight in the logs.
-    traj_path = os.path.join(out_dir, f"{subgoal}{suffix}{pose_tag}_after_{tag}_trajectory.json")
+    traj_path = os.path.join(out_dir, f"{subgoal}{suffix}{pose_tag}{size_tag}_after_{tag}_trajectory.json")
     with open(traj_path, "w") as f:
         json.dump(trajectory, f, indent=2)
     model_volume.commit()
@@ -367,13 +493,15 @@ def main(
     subgoal: str = "align_xy", seed: int = 0, max_steps: int = 30,
     ckpt_iter: int = 0, stochastic: bool = False,
     algo: str = "grpo", use_best: bool = False, use_pose_model: bool = True,
+    size: float = 0.0, width: float = 0.0, length: float = 0.0, height: float = 0.0,
 ):
     print(f"\nRecording before/after videos for subgoal={subgoal} algo={algo} "
-          f"use_best={use_best} use_pose_model={use_pose_model}...")
+          f"use_best={use_best} use_pose_model={use_pose_model} "
+          f"size={size} width={width} length={length} height={height}...")
     result = record_subgoal_video.remote(
         subgoal=subgoal, seed=seed, max_steps=max_steps,
         ckpt_iter=ckpt_iter, stochastic=stochastic, algo=algo, use_best=use_best,
-        use_pose_model=use_pose_model,
+        use_pose_model=use_pose_model, size=size, width=width, length=length, height=height,
     )
     b, a = result["results"]["before"], result["results"]["after"]
     print(f"\nDone.")

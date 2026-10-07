@@ -37,10 +37,10 @@ if it's poor with apply_setup_env=True, rerun with --no-apply-setup-env to
 check whether the shift specifically is the cause.
 
 Run with:
-    modal run scripts/collect_sb3_teacher_demos.py --n-episodes 20
-    modal run scripts/collect_sb3_teacher_demos.py --n-episodes 300 --max-steps 100
-    modal run scripts/collect_sb3_teacher_demos.py --no-apply-setup-env --n-episodes 20
-    modal run scripts/collect_sb3_teacher_demos.py --target-successes 100 --n-episodes 400
+    modal run scripts/multi-cube-experiment/collect_sb3_teacher_demos.py --n-episodes 20
+    modal run scripts/multi-cube-experiment/collect_sb3_teacher_demos.py --n-episodes 300 --max-steps 100
+    modal run scripts/multi-cube-experiment/collect_sb3_teacher_demos.py --no-apply-setup-env --n-episodes 20
+    modal run scripts/multi-cube-experiment/collect_sb3_teacher_demos.py --target-successes 100 --n-episodes 400
                                                               # keep attempting (seed
                                                               # 0,1,2,...) until 100
                                                               # SUCCESSFUL demos are

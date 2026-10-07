@@ -34,7 +34,7 @@ load-bearing, per this project's standing "don't overwrite anything"
 rule (see flat_policy_ppo_generalization memory's near-miss section).
 
 Run with:
-    modal run scripts/train_stack3_incontext_finetune.py
+    modal run scripts/multi-cube-experiment/train_stack3_incontext_finetune.py
 """
 
 import modal

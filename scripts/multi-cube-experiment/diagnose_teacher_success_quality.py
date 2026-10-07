@@ -21,7 +21,7 @@ duplicated rather than cross-imported, since scripts/ has no __init__.py
 and isn't set up for cross-script imports under `modal run`.
 
 Run with:
-    modal run scripts/diagnose_teacher_success_quality.py --n-seeds 30
+    modal run scripts/multi-cube-experiment/diagnose_teacher_success_quality.py --n-seeds 30
 """
 
 import modal

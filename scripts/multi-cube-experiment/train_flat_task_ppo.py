@@ -22,14 +22,27 @@ before training improves anything) applies identically here, since the
 warm-start source is exactly the same kind of checkpoint
 (flat_bc_multi_head.py's policy_type="mse" BC trainer).
 
-Eval uses the SAME genuine-grasp verification and fixed held-out seed
-convention (100_000+ep) as run_bc_scaling_cell/eval_elevated_target, for
-direct comparability against those numbers — NOT the shaped training
-reward, so a reward hack can't inflate the reported completion_rate.
+2026-10-03: added pose-randomization support, both for ROLLOUT COLLECTION
+(randomize_pose_prob, threaded into FlatTaskEnv — see that class's own
+docstring) and for EVAL. Warm-starting from a pose-randomized BC
+checkpoint isn't enough on its own to keep that generalization through
+PPO: if PPO's own rollouts never sample a randomized pose, nothing in
+training reinforces it, and the policy can drift back toward fixed-pose-
+only behavior over many iterations — the exact same mechanism that made
+a fixed-pose-only demo pool produce a fixed-pose-only policy in the first
+place. Eval now reports BOTH the old fixed-pose number and the pose-
+randomized one; best-checkpoint-saving and early-stopping key off the
+pose-randomized number specifically, since that's the actual
+generalization target, not the narrow metric every checkpoint before
+2026-10-03 was implicitly optimized against (confirmed misleading on its
+own: see the "Pose Generalization & Stacking" artifact's BC comparison,
+where the ORIGINAL fixed-pose-trained checkpoint scored 46.3% on the old
+eval but 0.0% on the pose-randomized one).
 
 Run with:
     modal run --detach scripts/train_flat_task_ppo.py \\
-        --warm-start-ckpt checkpoints/bc_scaling/mse_n2000_seed0_smw0.0_k5.pt
+        --warm-start-ckpt checkpoints/pose_randomized_v2/mse_n2000_seed1.pt \\
+        --randomize-pose-prob 1.0
     modal run --detach scripts/train_flat_task_ppo.py --n-workers 1 --n-iterations 3 --n-rollouts 8
                                                               # quick sanity check, no process pool
 """
@@ -63,7 +76,18 @@ def train_flat_task_ppo(
     discrepancy_weight: float = 2.0,
     drag_weight: float = 20.0,
     success_bonus: float = 5.0,
+    stillness_weight: float = 3.0,
+    randomize_pose_prob: float = 0.0,
+    pose_exclude_band: float = 0.35,
+    pose_max_frac: float = 0.85,
+    pose_scheme: str = "joint_angles",   # "joint_angles" (default) or "gripper_3d" --
+                                  # see FlatTaskEnv's own docstring, 2026-10-04. Applies to
+                                  # BOTH rollout collection AND eval below -- a mismatch
+                                  # between the two would silently eval against the wrong
+                                  # distribution for whatever checkpoint this run produces.
     ckpt_name: str = "flat_task_ppo",
+    architecture: str = "mse",   # "mse" (default) or "transformer" -- see FlatTaskPPOConfig/
+                                  # rollout_workers.py's _build_models_recurrent, 2026-10-05.
 ) -> dict:
     import os
     import glob
@@ -78,7 +102,9 @@ def train_flat_task_ppo(
     import gymnasium as gym
     import gymnasium_robotics  # noqa: F401
 
-    from think_then_act.env.setup import setup_env, init_random_episode, grip_contact_forces
+    from think_then_act.env.setup import (
+        setup_env, init_random_episode, grip_contact_forces, randomize_joint_angles, randomize_gripper_start_3d,
+    )
     from think_then_act.training.subgoal_features import build_flat_observation, FLAT_OBS_DIM
     from think_then_act.training.flat_task_ppo import FlatTaskPPOConfig, FlatTaskPPOTrainer
 
@@ -89,12 +115,14 @@ def train_flat_task_ppo(
     torch.manual_seed(seed)
 
     weights_kwargs = dict(discrepancy_weight=discrepancy_weight, drag_weight=drag_weight,
-                           success_bonus=success_bonus)
+                           success_bonus=success_bonus, stillness_weight=stillness_weight)
     config = FlatTaskPPOConfig(
         obs_dim=FLAT_OBS_DIM, max_episode_steps=max_episode_steps, n_rollouts=n_rollouts,
         n_workers=n_workers, rnn_hidden_size=rnn_hidden_size, episodes_per_minibatch=episodes_per_minibatch,
         gamma=gamma, gae_lambda=gae_lambda, lr=lr, entropy_coef=entropy_coef, clip_eps=clip_eps,
         n_epochs=n_epochs, weights_kwargs=weights_kwargs,
+        randomize_pose_prob=randomize_pose_prob, pose_exclude_band=pose_exclude_band, pose_max_frac=pose_max_frac,
+        pose_scheme=pose_scheme, architecture=architecture,
     )
     trainer = FlatTaskPPOTrainer(config)
 
@@ -109,6 +137,7 @@ def train_flat_task_ppo(
                   f"(std={math.exp(warm_start_log_std_init):.3f})")
 
     env_kwargs = config.env_kwargs()
+    print(f"  randomize_pose_prob={randomize_pose_prob} (rollout collection + eval)")
 
     if warm_start_ckpt and critic_warmup_iters > 0:
         print(f"  [warm-start] running {critic_warmup_iters} critic-only warmup iteration(s)...")
@@ -122,21 +151,36 @@ def train_flat_task_ppo(
             warmup_metrics = trainer.critic_warmup_step(warmup_rollouts)
             print(f"    critic warmup {wi+1}/{critic_warmup_iters}: value_loss={warmup_metrics['value_loss']:.4f}")
 
-    def run_eval(actor=None, n_eval_episodes: int = eval_episodes) -> dict:
+    def run_eval(actor=None, n_eval_episodes: int = eval_episodes, pose_randomize: bool = False) -> dict:
         """
         Genuine-grasp completion_rate on a FRESH plain FetchPickAndPlace-v3
-        (not FlatTaskEnv's shaped reward) — same verification and fixed
-        held-out seed convention (100_000+ep) as run_bc_scaling_cell/
-        eval_elevated_target, for direct comparability.
+        (not FlatTaskEnv's shaped reward) — same verification as run_bc_
+        scaling_cell/eval_elevated_target. pose_randomize=False uses the
+        OLD fixed-pose held-out seed convention (100_000+ep), directly
+        comparable to every number in this project before 2026-10-03.
+        pose_randomize=True uses a distinct seed range (200_000+ep,
+        matching scripts/train_bc_pose_randomized.py's own pose-randomized
+        eval) and perturbs the starting arm joint configuration the same
+        way env.setup.randomize_joint_angles always has since its fix.
         """
         actor = actor if actor is not None else trainer.actor
         eval_env = gym.make("FetchPickAndPlace-v3", max_episode_steps=max_episode_steps)
         setup_env(eval_env)
         n_genuine = 0
         n_raw = 0
+        n_pose_setup_failed = 0
+        seed_base = 200_000 if pose_randomize else 100_000
         for ep in range(n_eval_episodes):
-            rng = np.random.default_rng(100_000 + ep)
-            eval_env.reset(seed=100_000 + ep)
+            rng = np.random.default_rng(seed_base + ep)
+            reset_obs, _ = eval_env.reset(seed=seed_base + ep)
+            if pose_randomize:
+                if pose_scheme == "gripper_3d":
+                    obs, pose_ok, _ = randomize_gripper_start_3d(eval_env, rng, reset_obs)
+                else:
+                    obs, pose_ok = randomize_joint_angles(eval_env, rng, exclude_band=pose_exclude_band, max_frac=pose_max_frac)
+                if not pose_ok:
+                    n_pose_setup_failed += 1
+                    continue
             obs, setup_ok = init_random_episode(eval_env, rng)
             if not setup_ok:
                 continue
@@ -161,13 +205,36 @@ def train_flat_task_ppo(
                 n_genuine += 1
         eval_env.close()
         return {"completion_rate": n_genuine / n_eval_episodes if n_eval_episodes else 0.0,
-                "raw_success_rate": n_raw / n_eval_episodes if n_eval_episodes else 0.0}
+                "raw_success_rate": n_raw / n_eval_episodes if n_eval_episodes else 0.0,
+                "n_pose_setup_failed": n_pose_setup_failed}
+
+    def run_eval_both(actor=None, n_eval_episodes: int = eval_episodes) -> dict:
+        """
+        Runs both eval variants and combines into one dict. The PRIMARY
+        metric ("completion_rate") is whichever one matches what training
+        is actually optimizing for: pose-randomized when randomize_pose_
+        prob>0 (the real target — see module docstring), the old
+        fixed-pose metric otherwise (byte-identical behavior to before
+        2026-10-03 when randomize_pose_prob=0, its default).
+        """
+        fixed = run_eval(actor, n_eval_episodes, pose_randomize=False)
+        pose_rand = run_eval(actor, n_eval_episodes, pose_randomize=True)
+        primary = pose_rand if randomize_pose_prob > 0 else fixed
+        return {
+            "completion_rate": primary["completion_rate"],
+            "raw_success_rate": primary["raw_success_rate"],
+            "completion_rate_fixed_pose": fixed["completion_rate"],
+            "raw_success_rate_fixed_pose": fixed["raw_success_rate"],
+            "completion_rate_pose_randomized": pose_rand["completion_rate"],
+            "raw_success_rate_pose_randomized": pose_rand["raw_success_rate"],
+        }
 
     ckpt_dir = os.path.join(MODEL_CACHE_DIR, "checkpoints")
     best_ckpt_path = os.path.join(ckpt_dir, f"{ckpt_name}_best.pt")
-    initial_eval = run_eval()
-    print(f"  [eval @ iter 0 / warm-start] completion_rate={initial_eval['completion_rate']:.1%} "
-          f"raw_success_rate={initial_eval['raw_success_rate']:.1%}")
+    initial_eval = run_eval_both()
+    print(f"  [eval @ iter 0 / warm-start] fixed-pose={initial_eval['completion_rate_fixed_pose']:.1%}  "
+          f"pose-randomized={initial_eval['completion_rate_pose_randomized']:.1%}  "
+          f"(primary={initial_eval['completion_rate']:.1%})")
     best_completion_rate = initial_eval["completion_rate"]
     trainer.save_checkpoint(best_ckpt_path)
     model_volume.commit()
@@ -204,11 +271,12 @@ def train_flat_task_ppo(
                 trainer.save_checkpoint(ckpt)
                 model_volume.commit()
 
-                eval_result = run_eval()
+                eval_result = run_eval_both()
                 maybe_save_best(eval_result["completion_rate"])
                 eval_history.append({"iteration": i + 1, **eval_result})
-                print(f"  [eval @ iter {i+1}] completion_rate={eval_result['completion_rate']:.1%} "
-                      f"raw_success_rate={eval_result['raw_success_rate']:.1%} over {eval_episodes} episodes")
+                print(f"  [eval @ iter {i+1}] fixed-pose={eval_result['completion_rate_fixed_pose']:.1%}  "
+                      f"pose-randomized={eval_result['completion_rate_pose_randomized']:.1%}  "
+                      f"(primary={eval_result['completion_rate']:.1%}) over {eval_episodes} episodes")
 
                 if early_stop_patience > 0:
                     if eval_result["completion_rate"] >= early_stop_threshold:
@@ -217,7 +285,7 @@ def train_flat_task_ppo(
                         consecutive_at_threshold = 0
                     if consecutive_at_threshold >= early_stop_patience:
                         stopped_early_at = i + 1
-                        print(f"  [early-stop] completion_rate>={early_stop_threshold:.0%} held for "
+                        print(f"  [early-stop] primary completion_rate>={early_stop_threshold:.0%} held for "
                               f"{consecutive_at_threshold} consecutive eval checkpoints — stopping at "
                               f"iter {stopped_early_at}.")
                         break
@@ -231,15 +299,18 @@ def train_flat_task_ppo(
         if eval_history[-1]["iteration"] == final_iteration:
             final_eval = eval_history[-1]
         else:
-            final_eval = run_eval()
+            final_eval = run_eval_both()
             maybe_save_best(final_eval["completion_rate"])
             eval_history.append({"iteration": final_iteration, **final_eval})
 
-        print(f"  [eval] final completion_rate={final_eval['completion_rate']:.1%}")
-        print(f"  best  completion_rate={best_completion_rate:.1%} -> {best_ckpt_path}")
+        print(f"  [eval] final: fixed-pose={final_eval['completion_rate_fixed_pose']:.1%}  "
+              f"pose-randomized={final_eval['completion_rate_pose_randomized']:.1%}")
+        print(f"  best  primary completion_rate={best_completion_rate:.1%} -> {best_ckpt_path}")
         return {
             "status": "PASS", "ckpt_path": ckpt_out, "best_ckpt_path": best_ckpt_path,
             "completion_rate": round(final_eval["completion_rate"], 4),
+            "completion_rate_fixed_pose": round(final_eval["completion_rate_fixed_pose"], 4),
+            "completion_rate_pose_randomized": round(final_eval["completion_rate_pose_randomized"], 4),
             "best_completion_rate": round(best_completion_rate, 4),
             "eval_history": eval_history, "stopped_early_at": stopped_early_at,
         }
@@ -272,7 +343,13 @@ def main(
     discrepancy_weight: float = 2.0,
     drag_weight: float = 20.0,
     success_bonus: float = 5.0,
+    stillness_weight: float = 3.0,
+    randomize_pose_prob: float = 0.0,
+    pose_exclude_band: float = 0.35,
+    pose_max_frac: float = 0.85,
+    pose_scheme: str = "joint_angles",
     ckpt_name: str = "flat_task_ppo",
+    architecture: str = "mse",
 ):
     result = train_flat_task_ppo.remote(
         n_iterations=n_iterations, max_episode_steps=max_episode_steps, eval_episodes=eval_episodes,
@@ -282,6 +359,8 @@ def main(
         early_stop_patience=early_stop_patience, early_stop_threshold=early_stop_threshold,
         warm_start_ckpt=warm_start_ckpt, warm_start_log_std_init=warm_start_log_std_init,
         critic_warmup_iters=critic_warmup_iters, discrepancy_weight=discrepancy_weight,
-        drag_weight=drag_weight, success_bonus=success_bonus, ckpt_name=ckpt_name,
+        drag_weight=drag_weight, success_bonus=success_bonus, stillness_weight=stillness_weight,
+        randomize_pose_prob=randomize_pose_prob, pose_exclude_band=pose_exclude_band, pose_max_frac=pose_max_frac,
+        pose_scheme=pose_scheme, ckpt_name=ckpt_name, architecture=architecture,
     )
     print("\n", result)

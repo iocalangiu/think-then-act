@@ -1,0 +1,179 @@
+# Checkpoint registry for the SB3-teacher-imitation -> multi-cube-stacking
+# pipeline. Every number here was verified via an actual Modal eval run
+# during the 2026-10-05/07 sessions (see README.md "Findings" for how), not
+# recalled from memory. Loaded by model_registry.py; used by rollout.py.
+#
+# task: basic_skill | stack2
+# architecture: mse | cvae | transformer | diffusion
+# trained_via: bc | ppo | dagger | ppo_selfimitation
+# eval_protocol.seeds: inclusive "<start>-<end>" range, same seed set used
+#   for every checkpoint in its own table (so completion_rate values in the
+#   same group are directly comparable to each other).
+
+- name: teacher_sb3
+  path: null   # external SB3 PPO expert, not a checkpoint in this repo's volume
+  task: basic_skill
+  architecture: null
+  trained_via: null
+  completion_rate: 0.610
+  eval_protocol: {seeds: "n/a - own rollouts during demo collection", n: 3281, pose_scheme: gripper_3d}
+  notes: >
+    External SB3 expert policy from HuggingFace; the teacher every BC
+    checkpoint below was distilled from. completion_rate is the genuine-grasp
+    filter applied to its own demo-collection rollouts (3281 attempted,
+    2000 genuine successes kept as the BC training pool).
+
+- name: mse_bc_n2000_sweep
+  path: null   # 10-seed sweep, no single canonical file -- see note
+  task: basic_skill
+  architecture: mse
+  trained_via: bc
+  completion_rate: 0.427
+  eval_protocol: {seeds: "10-seed sweep, 10 independently-trained seeds", n: 10, pose_scheme: gripper_3d}
+  notes: >
+    BC-only, n=2000 demos. Mean across 10 independently-trained seeds (stdev
+    7.0pp), not one checkpoint file -- checkpoints/gripper3d_v1/
+    mse_n2000_seed0.pt is ONE of the 10, and was separately overwritten by
+    this same sweep after its path collided with an earlier, unrelated
+    checkpoint of the same name (see README Finding 6); don't treat it as
+    reproducing this exact number.
+
+- name: cvae_bc_n2000_sweep
+  path: null
+  task: basic_skill
+  architecture: cvae
+  trained_via: bc
+  completion_rate: 0.460
+  eval_protocol: {seeds: "10-seed sweep, 10 independently-trained seeds", n: 10, pose_scheme: gripper_3d}
+  notes: BC-only, n=2000 demos. Mean across 10 seeds; best of the 4 architectures at this demo count.
+
+- name: transformer_bc_n2000_sweep
+  path: null
+  task: basic_skill
+  architecture: transformer
+  trained_via: bc
+  completion_rate: 0.410
+  eval_protocol: {seeds: "10-seed sweep, 10 independently-trained seeds", n: 10, pose_scheme: gripper_3d}
+  notes: >
+    BC-only, n=2000 demos. Mean across 10 seeds. Notably more sample-
+    efficient at n=100 (8.0% vs ~1% for mse/cvae) despite converging to a
+    similar place by n=2000. checkpoints/gripper3d_v1/transformer_n2000_
+    seed0.pt is the seed-0 checkpoint used to warm-start transformer_dagger_v1
+    below.
+
+- name: diffusion_bc_n2000_sweep
+  path: null
+  task: basic_skill
+  architecture: diffusion
+  trained_via: bc
+  completion_rate: 0.140
+  eval_protocol: {seeds: "10-seed sweep, 10 independently-trained seeds", n: 10, pose_scheme: gripper_3d}
+  notes: >
+    BC-only, n=2000 demos, mean across 10 seeds, AFTER the noise-schedule
+    fix (beta_max 0.02->0.5 -- see README Finding 2). Clearly weakest
+    architecture throughout, but learning monotonically with data, not stuck.
+
+- name: mse_ppo_gripper3d_v1
+  path: checkpoints/flat_task_ppo_gripper3d_v1_cont_best.pt
+  task: basic_skill
+  architecture: mse
+  trained_via: ppo
+  completion_rate: 0.700
+  eval_protocol: {seeds: "200000-200029", n: 30, pose_scheme: gripper_3d}
+  notes: >
+    Best single-cube checkpoint. PPO-continued from mse_bc_n2000_seed0.
+    Root of the entire stack2 curriculum's warm-start chain.
+
+- name: transformer_dagger_v1
+  path: checkpoints/dagger_transformer_v1_best.pt
+  task: basic_skill
+  architecture: transformer
+  trained_via: dagger
+  completion_rate: 0.533
+  eval_protocol: {seeds: "200000-200029", n: 30, pose_scheme: gripper_3d}
+  notes: >
+    5 DAgger rounds, mse_ppo_gripper3d_v1 as the relabeling expert. Chosen
+    over a PPO retry after PPO collapsed twice for this architecture (see
+    transformer_ppo_lr1e4_unstable below and README Finding 4).
+
+- name: transformer_ppo_lr1e4_unstable
+  path: checkpoints/transformer_ppo_gripper3d_v1_lr1e4_best.pt
+  task: basic_skill
+  architecture: transformer
+  trained_via: ppo
+  completion_rate: 0.567
+  eval_protocol: {seeds: "200000-200029", n: 30, pose_scheme: gripper_3d}
+  superseded: true
+  notes: >
+    Single BEST-eval checkpoint from a run that peaked at iter 40 then
+    declined to 13.3% by iter 150 -- a real, confirmed collapse (dropout
+    train/eval mismatch, see README Finding 4), not a stable result. Shown
+    in Graph 1 for completeness, not recommended for use.
+
+- name: bc_multicube_alternating_v1
+  path: checkpoints/bc_multicube_alternating_v1.pt
+  task: stack2
+  architecture: mse
+  trained_via: bc
+  completion_rate: 0.0
+  eval_protocol: {seeds: "700000-700029", n: 30, pose_scheme: gripper_3d}
+  notes: >
+    Fresh policy trained from scratch on a mixed 1-cube/2-cube demo pool
+    (100 demos), alternating task type during training. Abandoned outright
+    -- 0% both before and after the release-settle fix.
+
+- name: bc_multicube_finetune_v1
+  path: checkpoints/bc_multicube_finetune_v1.pt
+  task: stack2
+  architecture: mse
+  trained_via: bc
+  completion_rate: 0.333
+  eval_protocol: {seeds: "700000-700029", n: 30, pose_scheme: gripper_3d}
+  notes: >
+    BC fine-tune of mse_ppo_gripper3d_v1 on 400 genuine 2-cube demos
+    (scripted hand-off: run the trained policy to place cube 1, scripted
+    release+ascend, run the policy again for cube 2 re-targeted on top).
+    Re-measured under the FIXED release-settle criterion -- was reported as
+    46.7% before the fix (README Finding 5); 33.3% is the real number.
+
+- name: bc_multicube_finetune_v2_600demos
+  path: checkpoints/bc_multicube_finetune_v2_600demos.pt
+  task: stack2
+  architecture: mse
+  trained_via: bc
+  completion_rate: 0.300
+  eval_protocol: {seeds: "700000-700029", n: 30, pose_scheme: gripper_3d}
+  notes: >
+    Same recipe as bc_multicube_finetune_v1 but 600 total demos (+200 more).
+    WORSE than the 400-demo version -- more data was not the fix here.
+    Re-measured 20.0%->30.0% under the criterion fix (see README Finding 5
+    for why this one moved UP while fine-tune_v1 moved down).
+
+- name: multicube_stack_ppo_selfimitation_v1
+  path: checkpoints/multicube_stack_ppo_selfimitation_v1_best.pt
+  task: stack2
+  architecture: mse
+  trained_via: ppo_selfimitation
+  completion_rate: 0.200
+  eval_protocol: {seeds: "700000-700029", n: 30, pose_scheme: gripper_3d}
+  superseded: true
+  superseded_by: multicube_stack_ppo_selfimitation_v2
+  notes: >
+    Trained against the BUGGY premature-"done" criterion (see README
+    Finding 5) -- reported 33.3% at the time, re-measured at 20.0% once the
+    eval was fixed, since this checkpoint's own training never required
+    genuine release+settle either. Kept for the record, not for use.
+
+- name: multicube_stack_ppo_selfimitation_v2
+  path: checkpoints/multicube_stack_ppo_selfimitation_v2_best.pt
+  task: stack2
+  architecture: mse
+  trained_via: ppo_selfimitation
+  completion_rate: 0.567
+  eval_protocol: {seeds: "700000-700029", n: 30, pose_scheme: gripper_3d}
+  notes: >
+    Current best 2-cube checkpoint. Retrained from scratch (warm-started
+    from bc_multicube_finetune_v1, 300 iterations) AFTER fixing
+    MultiCubeStackEnv's termination criterion to require genuine release +
+    a 10-consecutive-step unassisted settle. approx_kl settled to
+    0.002-0.004 by the end of training (clean convergence, no collapse).
