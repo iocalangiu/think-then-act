@@ -1,6 +1,6 @@
 # Multi-cube stacking: SB3-teacher imitation, architecture comparison, and a 2-cube curriculum
 
-![Basic-skill BC scaling vs. the teacher, and the 2-cube curriculum](scaling_curves.png)
+![Basic-skill BC scaling vs. the teacher, and the 2-cube curriculum](../../assets/multi-cube-experiment/scaling_curves.png)
 
 A robotic arm (Fetch, MuJoCo) learns to pick up a cube and place it on a
 target, then to stack a second cube on top of the first — starting from
